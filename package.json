@@ -1,41 +1,44 @@
 {
   "name": "opencode-slack-agent",
-  "version": "1.0.0",
-  "description": "Slack MCP server for OpenCode - command loop & bidirectional communication",
+  "version": "2.0.0",
+  "description": "OpenCode plugin — Slack DM & mention agent via Socket Mode",
   "type": "module",
-  "main": "dist/index.js",
-  "bin": {
-    "opencode-slack-agent": "dist/index.js"
+  "main": "dist/plugin.js",
+  "exports": {
+    ".": {
+      "types": "./dist/plugin.d.ts",
+      "import": "./dist/plugin.js",
+      "default": "./dist/plugin.js"
+    }
   },
   "files": [
     "dist",
-    ".opencode",
     "README.md"
   ],
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "tsx src/index.ts",
     "prepare": "npm run build"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/leecoder/opencode-slack-agent.git"
   },
-  "keywords": ["opencode", "slack", "mcp", "agent", "socket-mode"],
+  "keywords": [
+    "opencode",
+    "plugin",
+    "slack",
+    "agent",
+    "socket-mode"
+  ],
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1",
     "@slack/socket-mode": "^2.0.3",
-    "@slack/web-api": "^7.9.1",
-    "better-sqlite3": "^12.6.2",
-    "dotenv": "^17.4.2",
-    "zod": "^3.24.4"
+    "@slack/web-api": "^7.9.1"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
+    "@opencode-ai/plugin": "^1.17.13",
+    "@opencode-ai/sdk": "^1.17.13",
     "@types/node": "^22.15.0",
-    "tsx": "^4.19.4",
     "typescript": "^5.8.3"
   }
 }

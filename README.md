@@ -1,192 +1,104 @@
 # opencode-slack-agent
 
-Slack MCP server for [OpenCode](https://github.com/nicepkg/opencode) — enables AI agents to receive commands via Slack DM or @mention and respond using the full OpenCode toolchain.
+OpenCode plugin that connects Slack to your AI agent. Receives DMs and @mentions via Socket Mode, creates OpenCode sessions to process them, and sends responses back to Slack.
 
-## Features
-
-- **Socket Mode** — Real-time event reception via WebSocket, no polling or public endpoints
-- **Mention mode** — Respond to @mentions in any channel (default)
-- **DM mode** — Direct message conversation with the bot
-- **Channel mode** — Lock to a specific channel for focused operation
-- **Thread-based progress** — Intermediate steps go to threads, final results to channel
-- **Flexible channel resolution** — Accepts channel ID, #name, Slack URL, or user ID
-- **SQLite inbox** — Persistent message queue with WAL mode for multiprocess safety
-- **Auto-split long messages** — Messages over 4000 chars are chunked or uploaded as file
-- **Reaction commands** — Users can respond with emoji (✅ approve, ❌ reject, 🚀 proceed, etc.)
-
-## Architecture
+## How It Works
 
 ```
-┌─────────────────────────────────────────────────┐
-│  OpenCode Agent (skill: /slack-loop)            │
-│  ┌───────────────────────────────────────────┐  │
-│  │  MCP Client (skill_mcp)                   │  │
-│  └──────────────────┬────────────────────────┘  │
-│                     │ stdio                      │
-│  ┌──────────────────▼────────────────────────┐  │
-│  │  opencode-slack-agent (MCP Server)        │  │
-│  │  ├── Socket Mode (real-time events)       │  │
-│  │  ├── SQLite inbox (message queue)         │  │
-│  │  └── Slack Web API (send/react/read)      │  │
-│  └──────────────────┬────────────────────────┘  │
-└─────────────────────│───────────────────────────┘
-                      │ WebSocket + HTTPS
-                ┌─────▼─────┐
-                │   Slack   │
-                └───────────┘
+opencode serve
+  └─ [plugin: opencode-slack-agent]
+       ├─ Socket Mode (real-time Slack events)
+       ├─ DM or @mention received
+       │    └─ Creates new OpenCode session → AI processes → Response sent to Slack
+       └─ Runs as long as opencode serve is alive (no timeout)
 ```
-
-## Tools (10)
-
-| Tool | Description |
-|------|-------------|
-| `slack_command_loop` | Block-wait for next user command (30s cycles) |
-| `slack_check_inbox` | Non-blocking inbox check |
-| `slack_resolve_channel` | Resolve channel ID/name/URL → channel ID |
-| `slack_send_message` | Send message to channel |
-| `slack_respond` | Reply to user (auto-routes thread vs channel) |
-| `slack_reply_thread` | Reply in a specific thread |
-| `slack_read_messages` | Read recent channel messages |
-| `slack_get_thread` | Read full thread |
-| `slack_add_reaction` | Add emoji reaction |
-| `slack_list_channels` | List accessible channels |
 
 ## Setup
 
-### Prerequisites
+### 1. Create a Slack App
 
-- Node.js 18+
-- A Slack App with Socket Mode enabled
-- Bot token scopes: `im:read`, `im:write`, `channels:read`, `reactions:write`, `reactions:read`, `files:read`, `files:write`, `chat:write`
-- Event subscriptions: `message.im`, `app_mention`, `reaction_added`
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From scratch**
+2. Enable **Socket Mode** → generate App-Level Token (`xapp-...`) with scope `connections:write`
+3. Add **Bot Token Scopes** (OAuth & Permissions):
+   - `im:read`, `im:write`, `channels:read`, `chat:write`
+   - `reactions:write`, `reactions:read`, `files:read`, `files:write`
+4. Add **Event Subscriptions** (Subscribe to bot events):
+   - `message.im`, `app_mention`, `reaction_added`
+5. **Install to Workspace** → save Bot Token (`xoxb-...`)
 
-### Quick Install (one command)
+### 2. Install the Plugin
 
 ```bash
-npx -y github:leecoder/opencode-slack-agent --setup
+opencode plugin github:leecoder/opencode-slack-agent --global
 ```
 
-This copies `SKILL.md` and `mcp.json` to `~/.config/opencode/skills/slack-agent/`.
-After running, edit `mcp.json` to fill in your `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN`.
+Or add manually to `~/.config/opencode/opencode.json`:
 
-### Manual Installation
+```json
+{
+  "plugin": [
+    "opencode-slack-agent"
+  ]
+}
+```
 
-**Option A: Clone and build**
+### 3. Configure Environment
+
+Set these environment variables before starting opencode:
+
+```bash
+export SLACK_BOT_TOKEN="xoxb-..."
+export SLACK_APP_TOKEN="xapp-..."
+export OPENCODE_PORT="4096"  # must match serve --port
+```
+
+### 4. Run
+
+```bash
+opencode serve --port 4096
+```
+
+The plugin loads automatically. Send a DM to your bot or @mention it in any channel.
+
+## Behavior
+
+- **DM**: Bot responds to all direct messages
+- **@mention**: Bot responds when mentioned in channels (strips the mention prefix)
+- **Progress**: Shows 👀 reaction on receipt, ✅ on completion
+- **Long messages**: Auto-split into chunks or uploaded as file
+
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `SLACK_BOT_TOKEN` | Yes | Bot user OAuth token (`xoxb-...`) |
+| `SLACK_APP_TOKEN` | Yes | App-level token for Socket Mode (`xapp-...`) |
+| `OPENCODE_PORT` | Yes | Port that `opencode serve` listens on |
+| `OPENCODE_SERVER_PASSWORD` | No | Basic auth password (if serve requires auth) |
+| `NODE_EXTRA_CA_CERTS` | No | CA certificate bundle (corporate proxy) |
+
+## Development
 
 ```bash
 git clone https://github.com/leecoder/opencode-slack-agent.git
 cd opencode-slack-agent
 npm install
 npm run build
+
+# Register as local plugin
+opencode plugin /path/to/opencode-slack-agent --global --force
 ```
 
-**Option B: Direct from GitHub (no clone needed)**
+## Architecture
 
-```bash
-npx github:leecoder/opencode-slack-agent
-```
+The plugin uses OpenCode's v2 plugin API (`{id, setup}` format):
 
-Or in your OpenCode MCP config:
+1. `setup()` starts a Slack Socket Mode connection
+2. On DM/@mention → calls `session.create()` + `session.promptAsync()` via OpenCode SDK
+3. Polls session until assistant response is complete
+4. Sends response back to Slack
 
-```json
-{
-  "mcpServers": {
-    "slack-agent": {
-      "command": "npx",
-      "args": ["-y", "github:leecoder/opencode-slack-agent"],
-      "env": {
-        "SLACK_BOT_TOKEN": "xoxb-...",
-        "SLACK_APP_TOKEN": "xapp-..."
-      }
-    }
-  }
-}
-```
-
-### Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `SLACK_BOT_TOKEN` | Yes | Bot user OAuth token (`xoxb-...`) |
-| `SLACK_APP_TOKEN` | Yes | App-level token for Socket Mode (`xapp-...`) |
-
-### OpenCode Skill Setup
-
-1. Create the skill directory:
-
-```bash
-mkdir -p ~/.config/opencode/skills/slack-agent
-```
-
-2. Create `mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "slack-agent": {
-      "command": "npx",
-      "args": ["-y", "github:leecoder/opencode-slack-agent"],
-      "env": {
-        "SLACK_BOT_TOKEN": "xoxb-...",
-        "SLACK_APP_TOKEN": "xapp-..."
-      }
-    }
-  }
-}
-```
-
-Or if you cloned the repo locally:
-
-```json
-{
-  "mcpServers": {
-    "slack-agent": {
-      "command": "node",
-      "args": ["/path/to/opencode-slack-agent/dist/index.js"],
-      "env": {
-        "SLACK_BOT_TOKEN": "xoxb-...",
-        "SLACK_APP_TOKEN": "xapp-..."
-      }
-    }
-  }
-}
-```
-
-3. Copy `SKILL.md` from `.opencode/skill/slack-loop/SKILL.md` in this repository to the skill directory.
-
-## Usage
-
-### Mention mode (default — responds to @mentions in any channel + DMs)
-
-```bash
-opencode run "/slack-loop"
-```
-
-### Channel-specific mode
-
-```bash
-opencode run "/slack-loop D012EXAMPLE"
-opencode run "/slack-loop #general"
-opencode run "/slack-loop https://workspace.slack.com/archives/C01234ABCDE"
-```
-
-### With server mode (persistent, no timeout)
-
-```bash
-# Start server
-opencode serve --port 4096
-
-# Attach slack-loop to the server
-opencode run "/slack-loop" --attach http://localhost:4096
-```
-
-## Development
-
-```bash
-npm run dev    # Run with tsx (hot reload)
-npm run build  # Compile TypeScript
-npm start      # Run compiled output
-```
+Since the plugin runs inside the `opencode serve` process, there's no idle timeout — it stays alive as long as serve runs.
 
 ## License
 
