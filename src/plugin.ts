@@ -125,16 +125,21 @@ async function pollSessionCompletion(sessionID: string): Promise<void> {
 
 const plugin = {
   id: "opencode-slack-agent",
-  setup: async (_ctx: unknown) => {
-    const botToken = process.env.SLACK_BOT_TOKEN;
-    const appToken = process.env.SLACK_APP_TOKEN;
+  setup: async (ctx: { options: Record<string, unknown> }) => {
+    const botToken = (ctx.options.SLACK_BOT_TOKEN as string) || process.env.SLACK_BOT_TOKEN;
+    const appToken = (ctx.options.SLACK_APP_TOKEN as string) || process.env.SLACK_APP_TOKEN;
+    const port = (ctx.options.OPENCODE_PORT as string) || process.env.OPENCODE_PORT || "4096";
+    const caCerts = (ctx.options.NODE_EXTRA_CA_CERTS as string) || process.env.NODE_EXTRA_CA_CERTS;
+
+    if (caCerts && !process.env.NODE_EXTRA_CA_CERTS) {
+      process.env.NODE_EXTRA_CA_CERTS = caCerts;
+    }
 
     if (!botToken || !appToken) {
       console.error("[slack-agent] SLACK_BOT_TOKEN and SLACK_APP_TOKEN required — plugin disabled");
       return;
     }
 
-    const port = process.env.OPENCODE_PORT || "4096";
     const password = process.env.OPENCODE_SERVER_PASSWORD || "";
     const username = process.env.OPENCODE_SERVER_USERNAME || "opencode";
     const auth = password ? { username, password } : undefined;
