@@ -109,8 +109,6 @@ Or in your OpenCode MCP config:
 |----------|----------|-------------|
 | `SLACK_BOT_TOKEN` | Yes | Bot user OAuth token (`xoxb-...`) |
 | `SLACK_APP_TOKEN` | Yes | App-level token for Socket Mode (`xapp-...`) |
-| `SLACK_DEFAULT_CHANNEL` | No | Default channel ID (fallback when no channel specified) |
-| `NODE_EXTRA_CA_CERTS` | No | Path to CA certificate bundle (for corporate proxies) |
 
 ### OpenCode Skill Setup
 
