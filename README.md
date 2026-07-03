@@ -165,7 +165,7 @@ opencode run "/slack-loop"
 ### Channel-specific mode
 
 ```bash
-opencode run "/slack-loop D0BC8PB3D6Y"
+opencode run "/slack-loop D012EXAMPLE"
 opencode run "/slack-loop #general"
 opencode run "/slack-loop https://workspace.slack.com/archives/C01234ABCDE"
 ```
