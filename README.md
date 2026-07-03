@@ -29,6 +29,12 @@ opencode serve
 ### 2. Install the Plugin
 
 ```bash
+opencode plugin github:leecoder/opencode-slack-agent --global
+```
+
+If git install fails, use the release tarball:
+
+```bash
 opencode plugin https://github.com/leecoder/opencode-slack-agent/releases/download/v2.2.0/opencode-slack-agent-2.2.0.tgz --global
 ```
 
