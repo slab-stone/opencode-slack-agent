@@ -62,11 +62,36 @@ Slack MCP server for [OpenCode](https://github.com/nicepkg/opencode) — enables
 
 ### Installation
 
+**Option A: Clone and build**
+
 ```bash
 git clone https://github.com/leecoder/opencode-slack-agent.git
 cd opencode-slack-agent
 npm install
 npm run build
+```
+
+**Option B: Direct from GitHub (no clone needed)**
+
+```bash
+npx github:leecoder/opencode-slack-agent
+```
+
+Or in your OpenCode MCP config:
+
+```json
+{
+  "mcpServers": {
+    "slack-agent": {
+      "command": "npx",
+      "args": ["-y", "github:leecoder/opencode-slack-agent"],
+      "env": {
+        "SLACK_BOT_TOKEN": "xoxb-...",
+        "SLACK_APP_TOKEN": "xapp-..."
+      }
+    }
+  }
+}
 ```
 
 ### Environment Variables
@@ -92,28 +117,35 @@ mkdir -p ~/.config/opencode/skills/slack-agent
 {
   "mcpServers": {
     "slack-agent": {
-      "command": "/path/to/opencode-slack-agent/run.sh",
-      "args": []
+      "command": "npx",
+      "args": ["-y", "github:leecoder/opencode-slack-agent"],
+      "env": {
+        "SLACK_BOT_TOKEN": "xoxb-...",
+        "SLACK_APP_TOKEN": "xapp-..."
+      }
     }
   }
 }
 ```
 
-3. Create `run.sh`:
+Or if you cloned the repo locally:
 
-```bash
-#!/bin/bash
-export SLACK_BOT_TOKEN="xoxb-..."
-export SLACK_APP_TOKEN="xapp-..."
-export NODE_EXTRA_CA_CERTS="/path/to/ca-certificates.pem"  # optional
-exec node /path/to/opencode-slack-agent/dist/index.js
+```json
+{
+  "mcpServers": {
+    "slack-agent": {
+      "command": "node",
+      "args": ["/path/to/opencode-slack-agent/dist/index.js"],
+      "env": {
+        "SLACK_BOT_TOKEN": "xoxb-...",
+        "SLACK_APP_TOKEN": "xapp-..."
+      }
+    }
+  }
+}
 ```
 
-```bash
-chmod +x run.sh
-```
-
-4. Copy `SKILL.md` from this repository to the skill directory.
+3. Copy `SKILL.md` from `.opencode/skill/slack-loop/SKILL.md` in this repository to the skill directory.
 
 ## Usage
 

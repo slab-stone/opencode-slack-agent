@@ -4,11 +4,25 @@
   "description": "Slack MCP server for OpenCode - command loop & bidirectional communication",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "opencode-slack-agent": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc",
-    "start": "NODE_EXTRA_CA_CERTS=./ca-certificates.pem node dist/index.js",
-    "dev": "NODE_EXTRA_CA_CERTS=./ca-certificates.pem tsx src/index.ts"
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "prepare": "npm run build"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/leecoder/opencode-slack-agent.git"
+  },
+  "keywords": ["opencode", "slack", "mcp", "agent", "socket-mode"],
+  "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
     "@slack/socket-mode": "^2.0.3",
