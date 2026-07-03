@@ -29,7 +29,7 @@ opencode serve
 ### 2. Install the Plugin
 
 ```bash
-opencode plugin https://github.com/leecoder/opencode-slack-agent/releases/download/v2.1.0/opencode-slack-agent-2.1.0.tgz --global
+opencode plugin https://github.com/leecoder/opencode-slack-agent/releases/download/v2.2.0/opencode-slack-agent-2.2.0.tgz --global
 ```
 
 ### 3. Configure
@@ -41,20 +41,20 @@ Add plugin with tokens to `~/.config/opencode/opencode.json`:
   "plugin": [
     ["opencode-slack-agent", {
       "SLACK_BOT_TOKEN": "xoxb-...",
-      "SLACK_APP_TOKEN": "xapp-...",
-      "OPENCODE_PORT": "4096"
+      "SLACK_APP_TOKEN": "xapp-..."
     }]
   ]
 }
 ```
 
-Optional settings in the options object:
+Port and auth are auto-detected from the serve process. Only tokens are required.
+
+Optional settings:
 
 | Key | Required | Description |
 |-----|----------|-------------|
 | `SLACK_BOT_TOKEN` | Yes | Bot user OAuth token (`xoxb-...`) |
 | `SLACK_APP_TOKEN` | Yes | App-level token for Socket Mode (`xapp-...`) |
-| `OPENCODE_PORT` | Yes | Port that `opencode serve` listens on |
 | `NODE_EXTRA_CA_CERTS` | No | CA certificate bundle (corporate proxy) |
 
 ### 4. Run
@@ -74,14 +74,12 @@ The plugin loads automatically. Send a DM to your bot or @mention it in any chan
 
 ## Environment Variables
 
-All settings can be provided via `opencode.json` plugin options (recommended) or environment variables as fallback.
+All settings can be provided via `opencode.json` plugin options (recommended) or environment variables as fallback. Port and auth are auto-detected from the serve process.
 
 | Variable | Description |
 |----------|-------------|
 | `SLACK_BOT_TOKEN` | Bot user OAuth token (`xoxb-...`) |
 | `SLACK_APP_TOKEN` | App-level token for Socket Mode (`xapp-...`) |
-| `OPENCODE_PORT` | Port that `opencode serve` listens on |
-| `OPENCODE_SERVER_PASSWORD` | Basic auth password (if serve requires auth) |
 | `NODE_EXTRA_CA_CERTS` | CA certificate bundle (corporate proxy) |
 
 ## Development

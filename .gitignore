@@ -7,3 +7,4 @@ ca-certificates.pem
 .DS_Store
 .omo/
 .codegraph
+*.tgz

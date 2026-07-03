@@ -17,6 +17,12 @@ interface SlackEvent {
 
 const SLACK_MSG_LIMIT = 3900;
 
+function parsePortFromArgv(): string | undefined {
+  const idx = process.argv.indexOf("--port");
+  if (idx !== -1 && process.argv[idx + 1]) return process.argv[idx + 1];
+  return undefined;
+}
+
 let slack: WebClient;
 let socketClient: SocketModeClient;
 let botUserId: string | undefined;
@@ -128,7 +134,6 @@ const plugin = {
   setup: async (ctx: { options: Record<string, unknown> }) => {
     const botToken = (ctx.options.SLACK_BOT_TOKEN as string) || process.env.SLACK_BOT_TOKEN;
     const appToken = (ctx.options.SLACK_APP_TOKEN as string) || process.env.SLACK_APP_TOKEN;
-    const port = (ctx.options.OPENCODE_PORT as string) || process.env.OPENCODE_PORT || "4096";
     const caCerts = (ctx.options.NODE_EXTRA_CA_CERTS as string) || process.env.NODE_EXTRA_CA_CERTS;
 
     if (caCerts && !process.env.NODE_EXTRA_CA_CERTS) {
@@ -140,12 +145,12 @@ const plugin = {
       return;
     }
 
+    const port = parsePortFromArgv() || process.env.OPENCODE_PORT || "4096";
     const password = process.env.OPENCODE_SERVER_PASSWORD || "";
     const username = process.env.OPENCODE_SERVER_USERNAME || "opencode";
-    const auth = password ? { username, password } : undefined;
     client = createOpencodeClient({
       baseUrl: `http://127.0.0.1:${port}`,
-      ...(auth ? { auth: { type: "basic", ...auth } } : {}),
+      auth: password ? { type: "basic", username, password } : undefined,
     } as Parameters<typeof createOpencodeClient>[0]);
 
     slack = new WebClient(botToken);

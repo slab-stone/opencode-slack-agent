@@ -1,1 +1,1 @@
-{"version":3,"file":"plugin.d.ts","sourceRoot":"","sources":["../src/plugin.ts"],"names":[],"mappings":"AA6HA,QAAA,MAAM,MAAM;;iBAES;QAAE,OAAO,EAAE,MAAM,CAAC,MAAM,EAAE,OAAO,CAAC,CAAA;KAAE;CAiExD,CAAC;AAEF,eAAe,MAAM,CAAC"}
+{"version":3,"file":"plugin.d.ts","sourceRoot":"","sources":["../src/plugin.ts"],"names":[],"mappings":"AAmIA,QAAA,MAAM,MAAM;;iBAES;QAAE,OAAO,EAAE,MAAM,CAAC,MAAM,EAAE,OAAO,CAAC,CAAA;KAAE;CAgExD,CAAC;AAEF,eAAe,MAAM,CAAC"}
