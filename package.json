@@ -9,6 +9,7 @@
   },
   "files": [
     "dist",
+    ".opencode",
     "README.md"
   ],
   "scripts": {
