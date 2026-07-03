@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+*.db
+*.db-wal
+*.db-shm
+ca-certificates.pem
+.DS_Store
+.omo/
+.codegraph

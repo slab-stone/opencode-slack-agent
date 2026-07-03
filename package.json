@@ -1,0 +1,26 @@
+{
+  "name": "opencode-slack-agent",
+  "version": "1.0.0",
+  "description": "Slack MCP server for OpenCode - command loop & bidirectional communication",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "NODE_EXTRA_CA_CERTS=./ca-certificates.pem node dist/index.js",
+    "dev": "NODE_EXTRA_CA_CERTS=./ca-certificates.pem tsx src/index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@slack/socket-mode": "^2.0.3",
+    "@slack/web-api": "^7.9.1",
+    "better-sqlite3": "^12.6.2",
+    "dotenv": "^17.4.2",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.15.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}
