@@ -60,7 +60,16 @@ Slack MCP server for [OpenCode](https://github.com/nicepkg/opencode) — enables
 - Bot token scopes: `im:read`, `im:write`, `channels:read`, `reactions:write`, `reactions:read`, `files:read`, `files:write`, `chat:write`
 - Event subscriptions: `message.im`, `app_mention`, `reaction_added`
 
-### Installation
+### Quick Install (one command)
+
+```bash
+npx -y github:leecoder/opencode-slack-agent --setup
+```
+
+This copies `SKILL.md` and `mcp.json` to `~/.config/opencode/skills/slack-agent/`.
+After running, edit `mcp.json` to fill in your `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN`.
+
+### Manual Installation
 
 **Option A: Clone and build**
 
