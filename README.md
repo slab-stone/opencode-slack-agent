@@ -29,17 +29,7 @@ opencode serve
 ### 2. Install the Plugin
 
 ```bash
-opencode plugin github:leecoder/opencode-slack-agent --global
-```
-
-Or add manually to `~/.config/opencode/opencode.json`:
-
-```json
-{
-  "plugin": [
-    "opencode-slack-agent"
-  ]
-}
+opencode plugin https://github.com/leecoder/opencode-slack-agent/releases/download/v2.1.0/opencode-slack-agent-2.1.0.tgz --global
 ```
 
 ### 3. Configure
