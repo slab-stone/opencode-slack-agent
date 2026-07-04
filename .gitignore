@@ -8,3 +8,5 @@ ca-certificates.pem
 .omo/
 .codegraph
 *.tgz
+.playwright-mcp/
+*.png

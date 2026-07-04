@@ -1,176 +1,113 @@
-import { SocketModeClient } from "@slack/socket-mode";
-import { WebClient } from "@slack/web-api";
-import { createOpencodeClient } from "@opencode-ai/sdk";
-const SLACK_MSG_LIMIT = 3900;
-function parsePortFromArgv() {
-    const idx = process.argv.indexOf("--port");
-    if (idx !== -1 && process.argv[idx + 1])
-        return process.argv[idx + 1];
-    return undefined;
-}
-let slack;
-let socketClient;
-let botUserId;
-let client;
-const activeSessions = new Map();
-async function resolveBotUserId() {
-    if (botUserId)
-        return botUserId;
-    const auth = await slack.auth.test();
-    botUserId = auth.user_id;
-    return botUserId;
-}
-async function sendToSlack(channel, text, threadTs) {
-    if (text.length <= SLACK_MSG_LIMIT) {
-        const result = await slack.chat.postMessage({ channel, text, thread_ts: threadTs, mrkdwn: true });
-        return result.ts || "";
-    }
-    const chunks = [];
-    const lines = text.split("\n");
-    let current = "";
-    for (const line of lines) {
-        if (current.length + line.length + 1 > SLACK_MSG_LIMIT) {
-            chunks.push(current);
-            current = line;
-        }
-        else {
-            current = current ? current + "\n" + line : line;
-        }
-    }
-    if (current)
-        chunks.push(current);
-    let firstTs = "";
-    for (let i = 0; i < chunks.length; i++) {
-        const prefix = chunks.length > 1 ? `_(${i + 1}/${chunks.length})_\n` : "";
-        const result = await slack.chat.postMessage({
-            channel,
-            text: prefix + chunks[i],
-            thread_ts: i === 0 ? threadTs : (firstTs || threadTs),
-            mrkdwn: true,
-        });
-        if (i === 0 && result.ts)
-            firstTs = result.ts;
-    }
-    return firstTs;
-}
-async function handleMessage(channel, text, ts) {
-    try {
-        await slack.reactions.add({ channel, name: "eyes", timestamp: ts });
-    }
-    catch { }
-    try {
-        await sendToSlack(channel, "🔍 처리 중...", ts);
-        const session = await client.session.create({ body: { title: `Slack: ${text.slice(0, 50)}` } });
-        const sessionData = session.data;
-        if (!sessionData?.id) {
-            await sendToSlack(channel, "❌ 세션 생성 실패", ts);
-            return;
-        }
-        activeSessions.set(sessionData.id, { channel, ts });
-        await client.session.promptAsync({
-            path: { id: sessionData.id },
-            body: { parts: [{ type: "text", text }] },
-        });
-        pollSessionCompletion(sessionData.id);
-    }
-    catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        try {
-            await sendToSlack(channel, `❌ 오류: ${msg}`, ts);
-        }
-        catch { }
-    }
-}
-async function pollSessionCompletion(sessionID) {
-    const meta = activeSessions.get(sessionID);
-    if (!meta)
-        return;
-    for (let i = 0; i < 120; i++) {
-        await new Promise(r => setTimeout(r, 2000));
-        try {
-            const messagesResult = await client.session.messages({ path: { id: sessionID } });
-            const messages = (messagesResult.data || []);
-            const lastAssistant = [...messages].reverse().find(m => m.info.role === "assistant");
-            if (!lastAssistant?.info.time.completed)
-                continue;
-            const textParts = lastAssistant.parts
-                .filter(p => p.type === "text" && p.text)
-                .map(p => p.text)
-                .join("\n");
-            if (textParts) {
-                await sendToSlack(meta.channel, textParts);
-            }
-            try {
-                await slack.reactions.add({ channel: meta.channel, name: "white_check_mark", timestamp: meta.ts });
-            }
-            catch { }
-            activeSessions.delete(sessionID);
-            return;
-        }
-        catch {
-        }
-    }
-    await sendToSlack(meta.channel, "⏱️ 타임아웃 (4분)", meta.ts);
-    activeSessions.delete(sessionID);
-}
-const plugin = {
-    id: "opencode-slack-agent",
-    setup: async (ctx) => {
-        const botToken = ctx.options.SLACK_BOT_TOKEN || process.env.SLACK_BOT_TOKEN;
-        const appToken = ctx.options.SLACK_APP_TOKEN || process.env.SLACK_APP_TOKEN;
-        const caCerts = ctx.options.NODE_EXTRA_CA_CERTS || process.env.NODE_EXTRA_CA_CERTS;
-        if (caCerts && !process.env.NODE_EXTRA_CA_CERTS) {
-            process.env.NODE_EXTRA_CA_CERTS = caCerts;
-        }
-        if (!botToken || !appToken) {
-            console.error("[slack-agent] SLACK_BOT_TOKEN and SLACK_APP_TOKEN required — plugin disabled");
-            return;
-        }
-        const port = parsePortFromArgv() || process.env.OPENCODE_PORT || "4096";
-        const password = process.env.OPENCODE_SERVER_PASSWORD || "";
-        const username = process.env.OPENCODE_SERVER_USERNAME || "opencode";
-        client = createOpencodeClient({
-            baseUrl: `http://127.0.0.1:${port}`,
-            auth: password ? { type: "basic", username, password } : undefined,
-        });
-        slack = new WebClient(botToken);
-        socketClient = new SocketModeClient({ appToken });
-        await resolveBotUserId();
-        console.error(`[slack-agent] Bot connected (user: ${botUserId})`);
-        socketClient.on("message", async ({ event, ack }) => {
-            await ack();
-            const ev = event;
-            if (ev.bot_id || ev.user === botUserId)
-                return;
-            if (ev.subtype && ev.subtype !== "file_share")
-                return;
-            if (!ev.channel || !ev.text || !ev.ts)
-                return;
-            await handleMessage(ev.channel, ev.text, ev.ts);
-        });
-        socketClient.on("app_mention", async ({ event, ack }) => {
-            await ack();
-            const ev = event;
-            if (ev.user === botUserId)
-                return;
-            if (!ev.channel || !ev.text || !ev.ts)
-                return;
-            const text = ev.text.replace(/<@[A-Z0-9]+>/g, "").trim();
-            if (!text) {
-                await sendToSlack(ev.channel, "무엇을 도와드릴까요?", ev.ts);
-                return;
-            }
-            await handleMessage(ev.channel, text, ev.ts);
-        });
-        socketClient.on("connected", () => {
-            console.error("[slack-agent] Socket Mode connected");
-        });
-        socketClient.on("disconnected", () => {
-            console.error("[slack-agent] Socket Mode disconnected — will auto-reconnect");
-        });
-        await socketClient.start();
-        console.error("[slack-agent] Plugin initialized");
-    },
+// @bun
+var __require = import.meta.require;
+
+// src/plugin.ts
+import { spawn } from "child_process";
+import { appendFileSync, existsSync, writeFileSync } from "fs";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
+var LOG = "/tmp/slack-agent-plugin.log";
+var LOCK = "/tmp/slack-agent.lock";
+var log = (m) => {
+  try {
+    appendFileSync(LOG, `[${new Date().toISOString()}] plugin: ${m}
+`);
+  } catch {}
 };
-export default plugin;
-//# sourceMappingURL=plugin.js.map
+log("module top-level");
+function parsePortFromArgv() {
+  const idx = process.argv.indexOf("--port");
+  if (idx !== -1 && process.argv[idx + 1])
+    return process.argv[idx + 1];
+  return;
+}
+var worker = null;
+var initialized = false;
+function startWorker(env) {
+  const workerPath = join(dirname(fileURLToPath(import.meta.url)), "socket-worker.js");
+  log(`starting worker: ${workerPath}`);
+  worker = spawn("node", [workerPath], {
+    env: { ...process.env, ...env },
+    stdio: ["ignore", "ignore", "ignore"],
+    detached: false
+  });
+  worker.on("exit", (code) => {
+    log(`worker exited: code=${code}`);
+    worker = null;
+    if (existsSync(LOCK)) {
+      setTimeout(() => {
+        log("restarting worker...");
+        startWorker(env);
+      }, 5000);
+    }
+  });
+  log("worker spawned");
+}
+var slackStatusTool = {
+  description: "Slack \uC5D0\uC774\uC804\uD2B8 \uC0C1\uD0DC \uD655\uC778",
+  parameters: { type: "object", properties: {} },
+  execute: async () => {
+    const status = worker && !worker.killed ? "running" : "stopped";
+    return { content: [{ type: "text", text: `Slack agent: ${status}` }] };
+  }
+};
+var pluginModule = {
+  id: "opencode-slack-agent",
+  server: async (_input, options) => {
+    log("server() called");
+    if (initialized)
+      return { tool: { slack_status: slackStatusTool } };
+    if (existsSync(LOCK)) {
+      log("another instance running, skipping");
+      initialized = true;
+      return { tool: { slack_status: slackStatusTool } };
+    }
+    writeFileSync(LOCK, String(process.pid));
+    process.on("exit", () => {
+      try {
+        __require("fs").unlinkSync(LOCK);
+      } catch {}
+    });
+    const botToken = options?.SLACK_BOT_TOKEN || process.env.SLACK_BOT_TOKEN || "";
+    const appToken = options?.SLACK_APP_TOKEN || process.env.SLACK_APP_TOKEN || "";
+    const caCerts = options?.NODE_EXTRA_CA_CERTS || process.env.NODE_EXTRA_CA_CERTS || "";
+    if (!botToken || !appToken) {
+      log("DISABLED \u2014 missing tokens");
+      initialized = true;
+      return { tool: { slack_status: slackStatusTool } };
+    }
+    const port = parsePortFromArgv() || process.env.OPENCODE_PORT || "4096";
+    const password = process.env.OPENCODE_SERVER_PASSWORD || "";
+    const username = process.env.OPENCODE_SERVER_USERNAME || "opencode";
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const authHeader = password ? `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}` : "";
+    const workerEnv = {
+      SLACK_BOT_TOKEN: botToken,
+      SLACK_APP_TOKEN: appToken,
+      OPENCODE_BASE_URL: baseUrl,
+      OPENCODE_AUTH_HEADER: authHeader
+    };
+    if (caCerts)
+      workerEnv.NODE_EXTRA_CA_CERTS = caCerts;
+    startWorker(workerEnv);
+    initialized = true;
+    log(`plugin initialized (port=${port})`);
+    return {
+      tool: { slack_status: slackStatusTool },
+      dispose: async () => {
+        if (worker) {
+          worker.kill();
+          worker = null;
+        }
+        try {
+          __require("fs").unlinkSync(LOCK);
+        } catch {}
+        log("shutdown");
+      }
+    };
+  }
+};
+var plugin_default = pluginModule;
+export {
+  plugin_default as default
+};

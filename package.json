@@ -1,6 +1,6 @@
 {
   "name": "opencode-slack-agent",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "OpenCode plugin \u2014 Slack DM & mention agent via Socket Mode",
   "type": "module",
   "main": "dist/plugin.js",
@@ -9,7 +9,8 @@
       "types": "./dist/plugin.d.ts",
       "import": "./dist/plugin.js",
       "default": "./dist/plugin.js"
-    }
+    },
+    "./server": "./dist/plugin.js"
   },
   "files": [
     "dist",
