@@ -50,11 +50,6 @@ Add plugin with tokens to `~/.config/opencode/opencode.json`:
 
 Port and auth are auto-detected from the serve process. Only Slack tokens are required.
 
-For corporate proxy environments, add:
-```json
-"NODE_EXTRA_CA_CERTS": "/path/to/ca-certificates.pem"
-```
-
 ### 4. Run
 
 ```bash
