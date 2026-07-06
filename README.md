@@ -7,11 +7,10 @@ OpenCode plugin that connects Slack to your AI agent. Receives DMs and @mentions
 ```
 opencode serve
   └─ [plugin: opencode-slack-agent]
-       └─ spawns Node worker process
-            ├─ Socket Mode (real-time Slack events)
-            ├─ DM or @mention received
-            │    └─ Creates OpenCode session via HTTP API → AI processes
-            └─ Sends response back to Slack
+       ├─ Socket Mode (real-time Slack events, in-process)
+       ├─ DM or @mention received
+       │    └─ Creates OpenCode session via plugin client → AI processes
+       └─ Sends response back to Slack
 ```
 
 ## Setup
@@ -24,7 +23,7 @@ opencode serve
    - `im:read`, `im:write`, `im:history`, `channels:read`, `chat:write`
    - `reactions:write`, `reactions:read`, `files:read`, `files:write`
 4. Add **Event Subscriptions** (Subscribe to bot events):
-   - `message.im`, `app_mention`, `reaction_added`
+   - `message.im`, `app_mention`
 5. **Install to Workspace** → save Bot Token (`xoxb-...`)
 
 ### 2. Install the Plugin
@@ -48,39 +47,37 @@ Add plugin with tokens to `~/.config/opencode/opencode.json`:
 }
 ```
 
-Port and auth are auto-detected from the serve process. Only Slack tokens are required.
-
 ### 4. Run
 
 ```bash
 opencode serve --port 4096
 ```
 
-The plugin loads automatically and spawns a Node worker process for Socket Mode. Send a DM to your bot or @mention it in any channel.
+The plugin loads automatically and starts Socket Mode in-process. Send a DM to your bot or @mention it in any channel.
 
 ## Behavior
 
 - **DM**: Bot responds to all direct messages
 - **@mention**: Bot responds when mentioned in channels
 - **Progress**: Shows 👀 reaction on receipt, sends "처리 중..." in thread, ✅ on completion
-- **Final result**: Sent as channel message
 - **Long messages**: Auto-split into chunks
-- **Auto-restart**: Worker restarts automatically if it crashes
+- **Commands**: `!model` to list/switch models
 
 ## Architecture
 
-The plugin uses a sidecar pattern:
+The plugin runs entirely in-process within OpenCode's runtime:
 
-1. **Plugin** (runs in OpenCode's embedded Bun) — spawns and monitors the worker
-2. **Worker** (runs as independent Node.js process) — handles Socket Mode + OpenCode API
+1. **Plugin** loads inside `opencode serve`
+2. **Slack SDK** is bundled with tsup (noExternal) for Bun compatibility
+3. **OpenCode client** is accessed directly via `PluginInput.client` (no HTTP hop)
+4. **Socket Mode** WebSocket connection is managed within the plugin lifecycle
 
-This separation is necessary because OpenCode's embedded Bun runtime doesn't reliably deliver WebSocket events. The worker communicates with OpenCode via its HTTP API.
+No external processes, no lock files, no zombie process issues.
 
 ## Important
 
 - Only **one** Socket Mode connection should exist per app token at a time
 - If running OpenCode.app and CLI serve simultaneously, only one should have the plugin active
-- App-Level Token rotation may be needed if stale connections cause event delivery issues
 
 ## Development
 
@@ -88,8 +85,7 @@ This separation is necessary because OpenCode's embedded Bun runtime doesn't rel
 git clone https://github.com/leecoder/opencode-slack-agent.git
 cd opencode-slack-agent
 npm install
-bun build src/plugin.ts --target=bun --outdir=dist --format=esm --external=child_process --external=fs --external=path --external=url
-bun build src/socket-worker.mjs --target=node --outdir=dist --format=esm
+npm run build
 ```
 
 ## License

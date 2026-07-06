@@ -1,7 +1,7 @@
 {
   "name": "opencode-slack-agent",
-  "version": "2.3.0",
-  "description": "OpenCode plugin \u2014 Slack DM & mention agent via Socket Mode",
+  "version": "3.0.0",
+  "description": "OpenCode plugin — Slack DM & mention agent via Socket Mode",
   "type": "module",
   "main": "dist/plugin.js",
   "exports": {
@@ -17,7 +17,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc"
+    "build": "tsup"
   },
   "repository": {
     "type": "git",
@@ -34,5 +34,12 @@
   "dependencies": {
     "@slack/socket-mode": "^2.0.3",
     "@slack/web-api": "^7.9.1"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.17.13",
+    "@opencode-ai/sdk": "^1.17.13",
+    "@types/node": "^22.15.0",
+    "tsup": "^8.5.1",
+    "typescript": "^5.8.3"
   }
 }
