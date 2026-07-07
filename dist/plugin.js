@@ -12575,16 +12575,18 @@ async function handleQuestionReply(pending, text, channel, threadTs) {
     log(`question reply error: ${e.message}`);
   }
 }
-async function handleMessage(channel, text, ts, messageTs) {
+async function handleMessage(channel, text, ts, messageTs, isAllowed = true) {
   if (!pluginClient) return;
   const actualTs = messageTs || ts;
   log(`handleMessage: ${text.slice(0, 50)}`);
   if (text.startsWith("!")) {
+    if (!isAllowed) return;
     const handled = await handleCommand(channel, text, ts);
     if (handled) return;
   }
   const pending = findPendingPermissionForThread(ts);
   if (pending) {
+    if (!isAllowed) return;
     await handlePermissionReply(pending, text, channel, ts);
     return;
   }
@@ -12888,11 +12890,13 @@ function startWorker(env) {
   });
   worker.on("message", (msg) => {
     if (msg?.type === "slack_event") {
-      if (allowedUsers && !allowedUsers.has(msg.user)) {
-        log(`blocked user: ${msg.user}`);
+      const isAllowed = !allowedUsers || allowedUsers.has(msg.user);
+      const isThreadReply = msg.threadTs !== msg.messageTs;
+      if (!isAllowed && !isThreadReply) {
+        log(`blocked user: ${msg.user} (new thread)`);
         return;
       }
-      handleMessage(msg.channel, msg.text, msg.threadTs, msg.messageTs);
+      handleMessage(msg.channel, msg.text, msg.threadTs, msg.messageTs, isAllowed);
     } else if (msg?.type === "resolved_emails") {
       if (allowedUsers && msg.users) {
         for (const uid of msg.users) {
