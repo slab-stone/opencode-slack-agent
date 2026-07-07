@@ -12646,6 +12646,17 @@ async function handleMessage(channel, text, ts, messageTs, isAllowed = true) {
       log("SSE timeout (6min)");
       stream.return(void 0);
     }, 6 * 60 * 1e3);
+    const idleCheck = setInterval(async () => {
+      try {
+        const { data: status } = await pluginClient.session.status();
+        const sessionStatus = status?.[sessionId];
+        if (sessionStatus?.type === "idle") {
+          log(`session ${sessionId} idle via poll fallback`);
+          stream.return(void 0);
+        }
+      } catch {
+      }
+    }, 5e3);
     try {
       for await (const event of stream) {
         if (!event || !event.type) continue;
@@ -12730,6 +12741,7 @@ ${q.question}
       log(`SSE error: ${streamErr.message}`);
     } finally {
       clearTimeout(timeout);
+      clearInterval(idleCheck);
     }
     try {
       const { data: messages } = await pluginClient.session.messages({

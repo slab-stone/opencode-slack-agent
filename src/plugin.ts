@@ -260,6 +260,17 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
       stream.return(undefined);
     }, 6 * 60 * 1000);
 
+    const idleCheck = setInterval(async () => {
+      try {
+        const { data: status } = await pluginClient!.session.status();
+        const sessionStatus = status?.[sessionId];
+        if (sessionStatus?.type === "idle") {
+          log(`session ${sessionId} idle via poll fallback`);
+          stream.return(undefined);
+        }
+      } catch {}
+    }, 5000);
+
     try {
       for await (const event of stream) {
         if (!event || !(event as any).type) continue;
@@ -351,6 +362,7 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
       log(`SSE error: ${streamErr.message}`);
     } finally {
       clearTimeout(timeout);
+      clearInterval(idleCheck);
     }
 
     try {
