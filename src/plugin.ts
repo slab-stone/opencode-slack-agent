@@ -212,99 +212,120 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
     });
     log("prompt sent");
 
-    let streamMsgTs: string | null = null;
-    let lastToolSeen = 0;
     let questionPosted = false;
+    const seenParts = new Set<string>();
 
-    for (let i = 0; i < 180; i++) {
-      await new Promise(r => setTimeout(r, 1000));
-      try {
-        const { data: messages } = await pluginClient.session.messages({
-          path: { id: sessionId },
-        });
-        if (!Array.isArray(messages)) continue;
+    const eventResult = await pluginClient.event.subscribe();
+    const stream = eventResult?.stream;
+
+    if (!stream) {
+      log("SSE stream not available, falling back to polling");
+      slackSend(channel, "❌ 이벤트 스트림 연결 실패", threadTs);
+      sendIPC({ type: "slack_reaction_remove", channel, name: "peperun", timestamp: actualTs });
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      log("SSE timeout (6min)");
+      stream.return(undefined);
+    }, 6 * 60 * 1000);
+
+    try {
+      for await (const event of stream) {
+        if (!event || !(event as any).type) continue;
+        const evt = event as any;
+
+        if (evt.type === "message.part.updated") {
+          const part = evt.properties?.part;
+          if (!part || part.sessionID !== sessionId) continue;
+
+          const partKey = `${part.type}:${part.id}`;
+
+          if (part.type === "tool" && part.tool === "question" && part.state?.status === "running" && !questionPosted) {
+            questionPosted = true;
+            const input = part.state?.input || {};
+            const questions = input.questions || [];
+            let msg = "❓ *질문*\n";
+            for (const q of questions) {
+              msg += `\n*${q.header || ""}*\n${q.question}\n`;
+              if (q.options?.length) {
+                q.options.forEach((opt: any, idx: number) => {
+                  msg += `  *${idx + 1}.* ${opt.label}${opt.description ? ` — ${opt.description}` : ""}\n`;
+                });
+              }
+            }
+            msg += "\n_번호 또는 텍스트로 답해주세요_";
+            slackSend(channel, msg, threadTs);
+            pendingQuestions.set(threadTs, { sessionId, threadTs, channel, createdAt: Date.now() });
+            log(`question forwarded to slack for thread ${threadTs}`);
+            sendIPC({ type: "slack_reaction_remove", channel, name: "peperun", timestamp: actualTs });
+            clearTimeout(timeout);
+            return;
+          }
+
+          if (part.type === "tool" && part.tool !== "question" && part.state?.status === "running") {
+            if (!seenParts.has(partKey)) {
+              seenParts.add(partKey);
+              const title = part.state?.title || "";
+              const toolName = part.tool || "";
+              const input = part.state?.input || {};
+              let detail = title || toolName;
+              if (!title && input) {
+                const params = Object.entries(input)
+                  .filter(([k, v]) => v && typeof v === "string" && (v as string).length < 100)
+                  .map(([k, v]) => `${k}=${v}`)
+                  .slice(0, 2)
+                  .join(" ");
+                if (params) detail = `${toolName} ${params}`;
+              }
+              if (detail) {
+                slackSend(channel, `🔧 _${detail}_`, threadTs);
+                log(`stream: 🔧 _${detail}_`);
+              }
+            }
+          }
+
+          if (part.type === "reasoning" && part.text && !seenParts.has(partKey)) {
+            seenParts.add(partKey);
+            const snippet = part.text.length > 200 ? part.text.slice(0, 200) + "…" : part.text;
+            slackSend(channel, `💭 ${snippet}`, threadTs);
+            log(`stream: 💭`);
+          }
+        }
+
+        if (evt.type === "session.idle" && evt.properties?.sessionID === sessionId) {
+          log(`session ${sessionId} idle via SSE`);
+          break;
+        }
+      }
+    } catch (streamErr: any) {
+      log(`SSE error: ${streamErr.message}`);
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    try {
+      const { data: messages } = await pluginClient.session.messages({
+        path: { id: sessionId },
+      });
+      if (Array.isArray(messages)) {
         const lastAssistant = [...messages].reverse().find(
           (m: any) => m.info?.role === "assistant"
         );
-        if (!lastAssistant) continue;
-
-        const parts = lastAssistant.parts as any[];
-
-        const questionTool = parts.find((p: any) =>
-          p.type === "tool" && p.tool === "question" && p.state?.status === "running"
-        );
-        if (questionTool && !questionPosted) {
-          questionPosted = true;
-          const input = questionTool.state?.input || {};
-          const questions = input.questions || [];
-          let msg = "❓ *질문*\n";
-          for (const q of questions) {
-            msg += `\n*${q.header || ""}*\n${q.question}\n`;
-            if (q.options?.length) {
-              q.options.forEach((opt: any, idx: number) => {
-                msg += `  *${idx + 1}.* ${opt.label}${opt.description ? ` — ${opt.description}` : ""}\n`;
-              });
-            }
-          }
-          msg += "\n_번호 또는 텍스트로 답해주세요_";
-          slackSend(channel, msg, threadTs);
-          pendingQuestions.set(threadTs, {
-            sessionId,
-            threadTs,
-            channel,
-            createdAt: Date.now(),
-          });
-          log(`question forwarded to slack for thread ${threadTs}`);
-          sendIPC({ type: "slack_reaction_remove", channel, name: "peperun", timestamp: actualTs });
-          return;
+        if (lastAssistant) {
+          const textParts = (lastAssistant.parts as any[])
+            .filter((p: any) => p.type === "text" && p.text)
+            .map((p: any) => p.text)
+            .join("\n");
+          if (textParts) sendLongText(channel, textParts, threadTs);
         }
-
-        const activeParts = parts.filter((p: any) =>
-          (p.type === "reasoning") ||
-          (p.type === "text" && p.text && !lastAssistant.info?.time?.completed) ||
-          (p.type === "tool" && p.tool !== "question" && (p.state?.status === "running" || p.state?.status === "completed"))
-        );
-        if (parts.length === 0 || activeParts.length === 0) {
-          lastToolSeen = 0;
-        }
-        if (activeParts.length > lastToolSeen) {
-          lastToolSeen = activeParts.length;
-          const latest = activeParts[activeParts.length - 1];
-          let statusText = "";
-          if (latest.type === "reasoning" && latest.text) {
-            const snippet = latest.text.length > 200 ? latest.text.slice(0, 200) + "…" : latest.text;
-            statusText = `💭 ${snippet}`;
-          } else if (latest.type === "text" && latest.text) {
-            const snippet = latest.text.length > 200 ? latest.text.slice(0, 200) + "…" : latest.text;
-            statusText = `💬 ${snippet}`;
-          } else if (latest.type === "tool") {
-            const title = latest.state?.title || latest.tool || "";
-            if (title) statusText = `🔧 _${title}_`;
-          }
-          if (statusText) {
-            slackSend(channel, statusText, threadTs);
-            log(`stream: ${statusText.slice(0, 50)}`);
-          }
-        }
-
-        if (!lastAssistant.info?.time?.completed) continue;
-
-        const textParts = parts
-          .filter((p: any) => p.type === "text" && p.text)
-          .map((p: any) => p.text)
-          .join("\n");
-
-        if (textParts) {
-          sendLongText(channel, textParts, threadTs);
-        }
-        sendIPC({ type: "slack_reaction_remove", channel, name: "peperun", timestamp: actualTs });
-        log(`session ${sessionId} completed`);
-        return;
-      } catch (pollErr: any) {
-        log(`poll error: ${pollErr.message}`);
       }
+    } catch (fetchErr: any) {
+      log(`final fetch error: ${fetchErr.message}`);
     }
-    slackSend(channel, "⏱️ 타임아웃 (6분)", threadTs);
+
+    sendIPC({ type: "slack_reaction_remove", channel, name: "peperun", timestamp: actualTs });
+    log(`session ${sessionId} completed`);
   } catch (e: any) {
     log(`error: ${e.message}`);
     slackSend(channel, `❌ 오류: ${e.message}`, ts);
