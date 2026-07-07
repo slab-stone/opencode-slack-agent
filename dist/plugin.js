@@ -12607,7 +12607,7 @@ async function handleMessage(channel, text, ts, messageTs) {
     let lastToolSeen = 0;
     let questionPosted = false;
     for (let i = 0; i < 180; i++) {
-      await new Promise((r) => setTimeout(r, 2e3));
+      await new Promise((r) => setTimeout(r, 1e3));
       try {
         const { data: messages } = await pluginClient.session.messages({
           path: { id: sessionId }
@@ -12653,6 +12653,9 @@ ${q.question}
         const activeParts = parts.filter(
           (p) => p.type === "reasoning" || p.type === "text" && p.text && !lastAssistant.info?.time?.completed || p.type === "tool" && p.tool !== "question" && (p.state?.status === "running" || p.state?.status === "completed")
         );
+        if (parts.length === 0 || activeParts.length === 0) {
+          lastToolSeen = 0;
+        }
         if (activeParts.length > lastToolSeen) {
           lastToolSeen = activeParts.length;
           const latest = activeParts[activeParts.length - 1];

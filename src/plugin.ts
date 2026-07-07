@@ -217,7 +217,7 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
     let questionPosted = false;
 
     for (let i = 0; i < 180; i++) {
-      await new Promise(r => setTimeout(r, 2000));
+      await new Promise(r => setTimeout(r, 1000));
       try {
         const { data: messages } = await pluginClient.session.messages({
           path: { id: sessionId },
@@ -264,6 +264,9 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
           (p.type === "text" && p.text && !lastAssistant.info?.time?.completed) ||
           (p.type === "tool" && p.tool !== "question" && (p.state?.status === "running" || p.state?.status === "completed"))
         );
+        if (parts.length === 0 || activeParts.length === 0) {
+          lastToolSeen = 0;
+        }
         if (activeParts.length > lastToolSeen) {
           lastToolSeen = activeParts.length;
           const latest = activeParts[activeParts.length - 1];
