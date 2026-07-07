@@ -72,8 +72,12 @@ async function addReaction(channel, name, timestamp) {
 process.on("message", async (msg) => {
   if (msg?.type === "slack_send") {
     await sendToSlack(msg.channel, msg.text, msg.threadTs);
+  } else if (msg?.type === "slack_update") {
+    try { await slack.chat.update({ channel: msg.channel, ts: msg.ts, text: msg.text, mrkdwn: true }); } catch {}
   } else if (msg?.type === "slack_reaction") {
     await addReaction(msg.channel, msg.name, msg.timestamp);
+  } else if (msg?.type === "slack_reaction_remove") {
+    try { await slack.reactions.remove({ channel: msg.channel, name: msg.name, timestamp: msg.timestamp }); } catch {}
   }
 });
 
@@ -92,7 +96,7 @@ socketClient.on("slack_event", async ({ body, ack }) => {
       : ev.text;
 
     if (text && process.send) {
-      process.send({ type: "slack_event", channel: ev.channel, text, ts: ev.ts });
+      process.send({ type: "slack_event", channel: ev.channel, text, ts: ev.ts, threadTs: ev.thread_ts || ev.ts });
       log(`event sent via IPC: ${text.slice(0, 50)}`);
     }
   }

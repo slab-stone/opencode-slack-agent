@@ -12428,14 +12428,18 @@ tool.schema = external_exports;
 
 // src/plugin.ts
 import { spawn } from "child_process";
-import { appendFileSync } from "fs";
+import { appendFileSync, readFileSync, writeFileSync, existsSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 var LOG_FILE = "/tmp/slack-agent-plugin.log";
+var SLACK_MSG_LIMIT = 3900;
 var initialized = false;
 var worker = null;
 var pluginClient = null;
 var modelOverride = null;
+var sessionsPath = "";
+var sessions = {};
+var defaultDirectory = "";
 function log(m) {
   try {
     appendFileSync(LOG_FILE, `[${(/* @__PURE__ */ new Date()).toISOString()}] plugin: ${m}
@@ -12443,14 +12447,42 @@ function log(m) {
   } catch {
   }
 }
-async function sendToSlack(channel, text, threadTs) {
-  if (!worker) return;
-  const msg = { type: "slack_send", channel, text, threadTs };
-  worker.send(msg);
+function loadSessions() {
+  try {
+    if (existsSync(sessionsPath)) {
+      sessions = JSON.parse(readFileSync(sessionsPath, "utf8"));
+    }
+  } catch {
+    sessions = {};
+  }
 }
-async function addReaction(channel, name, timestamp) {
-  if (!worker) return;
-  worker.send({ type: "slack_reaction", channel, name, timestamp });
+function saveSessions() {
+  try {
+    writeFileSync(sessionsPath, JSON.stringify(sessions, null, 2));
+  } catch {
+  }
+}
+function getSessionForThread(threadTs) {
+  const entry = sessions[threadTs];
+  if (entry) {
+    entry.lastUsed = Date.now();
+    saveSessions();
+    return entry.sessionId;
+  }
+  return null;
+}
+function saveSession(threadTs, sessionId, channel, directory) {
+  sessions[threadTs] = { sessionId, channel, lastUsed: Date.now(), ...directory ? { directory } : {} };
+  saveSessions();
+}
+function sendIPC(msg) {
+  if (worker && worker.connected) worker.send(msg);
+}
+function slackSend(channel, text, threadTs) {
+  sendIPC({ type: "slack_send", channel, text, threadTs });
+}
+function slackUpdate(channel, ts, text) {
+  sendIPC({ type: "slack_update", channel, ts, text });
 }
 async function handleMessage(channel, text, ts) {
   if (!pluginClient) return;
@@ -12459,50 +12491,114 @@ async function handleMessage(channel, text, ts) {
     const handled = await handleCommand(channel, text, ts);
     if (handled) return;
   }
-  await addReaction(channel, "eyes", ts);
-  await sendToSlack(channel, "\u{1F50D} \uCC98\uB9AC \uC911...", ts);
   try {
-    const { data: session } = await pluginClient.session.create({
-      body: { title: `Slack: ${text.slice(0, 50)}` }
-    });
-    if (!session?.id) {
-      await sendToSlack(channel, "\u274C \uC138\uC158 \uC0DD\uC131 \uC2E4\uD328", ts);
-      return;
+    const threadTs = ts;
+    let sessionId = getSessionForThread(threadTs);
+    sendIPC({ type: "slack_reaction", channel, name: "peperun", timestamp: ts });
+    if (!sessionId) {
+      const directory = sessions[threadTs]?.directory || defaultDirectory;
+      const { data: session } = await pluginClient.session.create({
+        body: { title: `Slack: ${text.slice(0, 50)}` },
+        query: directory ? { directory } : void 0
+      });
+      if (!session?.id) {
+        slackSend(channel, "\u274C \uC138\uC158 \uC0DD\uC131 \uC2E4\uD328", threadTs);
+        return;
+      }
+      sessionId = session.id;
+      saveSession(threadTs, sessionId, channel, directory);
+      log(`new session: ${sessionId} for thread ${threadTs} (dir: ${directory || "default"})`);
+    } else {
+      log(`existing session: ${sessionId} for thread ${threadTs}`);
     }
-    log(`session: ${session.id}`);
     const promptBody = {
       parts: [{ type: "text", text }]
     };
     if (modelOverride) promptBody.model = modelOverride;
     await pluginClient.session.promptAsync({
-      path: { id: session.id },
+      path: { id: sessionId },
       body: promptBody
     });
     log("prompt sent");
-    for (let i = 0; i < 120; i++) {
+    let streamMsgTs = null;
+    let lastToolSeen = 0;
+    for (let i = 0; i < 180; i++) {
       await new Promise((r) => setTimeout(r, 2e3));
       try {
         const { data: messages } = await pluginClient.session.messages({
-          path: { id: session.id }
+          path: { id: sessionId }
         });
         if (!Array.isArray(messages)) continue;
         const lastAssistant = [...messages].reverse().find(
           (m) => m.info?.role === "assistant"
         );
-        if (!lastAssistant?.info?.time?.completed) continue;
-        const textParts = lastAssistant.parts.filter((p) => p.type === "text" && p.text).map((p) => p.text).join("\n");
-        if (textParts) await sendToSlack(channel, textParts, ts);
-        await addReaction(channel, "white_check_mark", ts);
-        log(`session ${session.id} completed`);
+        if (!lastAssistant) continue;
+        const parts = lastAssistant.parts;
+        const activeParts = parts.filter(
+          (p) => p.type === "reasoning" || p.type === "tool" && (p.state?.status === "running" || p.state?.status === "completed")
+        );
+        if (activeParts.length > lastToolSeen) {
+          lastToolSeen = activeParts.length;
+          const latest = activeParts[activeParts.length - 1];
+          let statusText = "";
+          if (latest.type === "reasoning" && latest.text) {
+            const snippet = latest.text.length > 200 ? latest.text.slice(0, 200) + "\u2026" : latest.text;
+            statusText = `\u{1F4AD} ${snippet}`;
+          } else if (latest.type === "tool") {
+            const title = latest.state?.title || latest.tool || "";
+            if (title) statusText = `\u{1F527} _${title}_`;
+          }
+          if (statusText) {
+            if (streamMsgTs) {
+              slackUpdate(channel, streamMsgTs, statusText);
+            } else {
+              slackSend(channel, statusText, threadTs);
+            }
+          }
+        }
+        if (!lastAssistant.info?.time?.completed) continue;
+        const textParts = parts.filter((p) => p.type === "text" && p.text).map((p) => p.text).join("\n");
+        if (textParts) {
+          sendLongText(channel, textParts, threadTs);
+        }
+        sendIPC({ type: "slack_reaction_remove", channel, name: "peperun", timestamp: ts });
+        log(`session ${sessionId} completed`);
         return;
       } catch (pollErr) {
         log(`poll error: ${pollErr.message}`);
       }
     }
-    await sendToSlack(channel, "\u23F1\uFE0F \uD0C0\uC784\uC544\uC6C3 (4\uBD84)", ts);
+    slackSend(channel, "\u23F1\uFE0F \uD0C0\uC784\uC544\uC6C3 (6\uBD84)", threadTs);
   } catch (e) {
     log(`error: ${e.message}`);
-    await sendToSlack(channel, `\u274C \uC624\uB958: ${e.message}`, ts);
+    slackSend(channel, `\u274C \uC624\uB958: ${e.message}`, ts);
+  }
+}
+function splitText(text) {
+  const chunks = [];
+  const lines = text.split("\n");
+  let current = "";
+  for (const line of lines) {
+    if (current.length + line.length + 1 > SLACK_MSG_LIMIT) {
+      chunks.push(current);
+      current = line;
+    } else {
+      current = current ? current + "\n" + line : line;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+function sendLongText(channel, text, threadTs) {
+  if (text.length <= SLACK_MSG_LIMIT) {
+    slackSend(channel, text, threadTs);
+    return;
+  }
+  const chunks = splitText(text);
+  for (let i = 0; i < chunks.length; i++) {
+    const prefix = chunks.length > 1 ? `_(${i + 1}/${chunks.length})_
+` : "";
+    slackSend(channel, prefix + chunks[i], threadTs);
   }
 }
 async function handleCommand(channel, text, ts) {
@@ -12526,21 +12622,80 @@ async function handleCommand(channel, text, ts) {
       } catch {
         lines.push("_(\uBAA8\uB378 \uBAA9\uB85D\uC744 \uAC00\uC838\uC62C \uC218 \uC5C6\uC2B5\uB2C8\uB2E4)_");
       }
-      await sendToSlack(channel, lines.join("\n"), ts);
+      slackSend(channel, lines.join("\n"), ts);
       return true;
     }
     if (arg === "reset" || arg === "default") {
       modelOverride = null;
-      await sendToSlack(channel, "\u2705 \uAE30\uBCF8 \uBAA8\uB378\uB85C \uBCF5\uC6D0", ts);
+      slackSend(channel, "\u2705 \uAE30\uBCF8 \uBAA8\uB378\uB85C \uBCF5\uC6D0", ts);
       return true;
     }
     const match = arg.match(/^([^/]+)\/(.+)$/);
     if (match) {
       modelOverride = { providerID: match[1], modelID: match[2] };
-      await sendToSlack(channel, `\u2705 \uBAA8\uB378 \uBCC0\uACBD: \`${arg}\``, ts);
+      slackSend(channel, `\u2705 \uBAA8\uB378 \uBCC0\uACBD: \`${arg}\``, ts);
     } else {
-      await sendToSlack(channel, `\u274C \uD615\uC2DD: \`!model provider/model\` (\uC608: \`!model kiro/claude-sonnet-4-6\`)`, ts);
+      slackSend(channel, `\u274C \uD615\uC2DD: \`!model provider/model\` (\uC608: \`!model kiro/claude-sonnet-4-6\`)`, ts);
     }
+    return true;
+  }
+  if (cmd === "!reset") {
+    delete sessions[ts];
+    saveSessions();
+    slackSend(channel, "\u2705 \uC138\uC158 \uB9AC\uC14B\uB428. \uB2E4\uC74C \uBA54\uC2DC\uC9C0\uBD80\uD130 \uC0C8 \uC138\uC158.", ts);
+    return true;
+  }
+  if (cmd === "!dir") {
+    const arg = parts.slice(1).join(" ").trim();
+    if (!arg) {
+      const currentDir = sessions[ts]?.directory || defaultDirectory || "(\uAE30\uBCF8)";
+      slackSend(channel, `*\uD604\uC7AC \uC6CC\uD06C\uC2A4\uD398\uC774\uC2A4:* \`${currentDir}\``, ts);
+      return true;
+    }
+    if (!sessions[ts]) {
+      sessions[ts] = { sessionId: "", channel, lastUsed: Date.now(), directory: arg };
+    } else {
+      sessions[ts].directory = arg;
+    }
+    saveSessions();
+    slackSend(channel, `\u2705 \uC6CC\uD06C\uC2A4\uD398\uC774\uC2A4 \uBCC0\uACBD: \`${arg}\`
+\uB2E4\uC74C \uBA54\uC2DC\uC9C0\uBD80\uD130 \uC774 \uB514\uB809\uD1A0\uB9AC\uC5D0\uC11C \uC138\uC158 \uC0DD\uC131.`, ts);
+    return true;
+  }
+  if (cmd === "!attach") {
+    const arg = parts.slice(1).join(" ").trim();
+    if (!arg) {
+      const currentSession = sessions[ts]?.sessionId || "(\uC5C6\uC74C)";
+      slackSend(channel, `*\uD604\uC7AC \uC138\uC158:* \`${currentSession}\``, ts);
+      return true;
+    }
+    let sessionId = arg;
+    const urlMatch = arg.match(/\/session\/(ses_[a-zA-Z0-9]+)/);
+    if (urlMatch) {
+      sessionId = urlMatch[1];
+    }
+    if (!sessionId.startsWith("ses_")) {
+      slackSend(channel, `\u274C \uD615\uC2DD: \`!attach ses_xxx\` \uB610\uB294 OpenCode URL \uBD99\uC5EC\uB123\uAE30`, ts);
+      return true;
+    }
+    saveSession(ts, sessionId, channel, sessions[ts]?.directory);
+    slackSend(channel, `\u2705 \uC138\uC158 \uC5F0\uACB0: \`${sessionId}\`
+\uC774 \uC2A4\uB808\uB4DC\uC758 \uBA54\uC2DC\uC9C0\uAC00 \uD574\uB2F9 \uC138\uC158\uC73C\uB85C \uC804\uB2EC\uB429\uB2C8\uB2E4.`, ts);
+    return true;
+  }
+  if (cmd === "!help") {
+    const help = [
+      "*\uC0AC\uC6A9 \uAC00\uB2A5\uD55C \uBA85\uB839:*",
+      "\u2022 `!model` \u2014 \uD604\uC7AC \uBAA8\uB378 \uD655\uC778 / \uBCC0\uACBD",
+      "\u2022 `!model provider/model` \u2014 \uBAA8\uB378 \uBCC0\uACBD",
+      "\u2022 `!model reset` \u2014 \uAE30\uBCF8 \uBAA8\uB378 \uBCF5\uC6D0",
+      "\u2022 `!dir` \u2014 \uD604\uC7AC \uC6CC\uD06C\uC2A4\uD398\uC774\uC2A4 \uD655\uC778",
+      "\u2022 `!dir /path/to/project` \u2014 \uC6CC\uD06C\uC2A4\uD398\uC774\uC2A4 \uBCC0\uACBD",
+      "\u2022 `!attach ses_xxx` \u2014 \uAE30\uC874 \uC138\uC158 \uC5F0\uACB0 (URL \uBD99\uC5EC\uB123\uAE30 \uAC00\uB2A5)",
+      "\u2022 `!reset` \u2014 \uD604\uC7AC \uC2A4\uB808\uB4DC \uC138\uC158 \uB9AC\uC14B",
+      "\u2022 `!help` \u2014 \uC774 \uB3C4\uC6C0\uB9D0"
+    ];
+    slackSend(channel, help.join("\n"), ts);
     return true;
   }
   return false;
@@ -12555,7 +12710,7 @@ function startWorker(env) {
   });
   worker.on("message", (msg) => {
     if (msg?.type === "slack_event") {
-      handleMessage(msg.channel, msg.text, msg.ts);
+      handleMessage(msg.channel, msg.text, msg.threadTs);
     }
   });
   worker.on("exit", (code) => {
@@ -12583,7 +12738,8 @@ var slackStatusTool = tool({
   args: {},
   async execute() {
     const status = worker && !worker.killed ? "running" : "stopped";
-    return { output: `Slack agent: ${status}` };
+    const sessionCount = Object.keys(sessions).length;
+    return { output: `Slack agent: ${status}, sessions: ${sessionCount}` };
   }
 });
 var pluginModule = {
@@ -12605,6 +12761,10 @@ var pluginModule = {
       return { tool: { slack_status: slackStatusTool } };
     }
     pluginClient = input.client;
+    defaultDirectory = options?.DEFAULT_DIRECTORY || process.env.SLACK_DEFAULT_DIRECTORY || input.directory;
+    sessionsPath = join(input.directory, "slack-sessions.json");
+    loadSessions();
+    log(`sessions loaded: ${Object.keys(sessions).length} entries from ${sessionsPath}`);
     const workerEnv = {
       SLACK_BOT_TOKEN: botToken,
       SLACK_APP_TOKEN: appToken
@@ -12613,7 +12773,7 @@ var pluginModule = {
     if (caCerts) workerEnv.NODE_EXTRA_CA_CERTS = caCerts;
     startWorker(workerEnv);
     initialized = true;
-    log("plugin initialized (hybrid sidecar)");
+    log("plugin initialized (hybrid sidecar + persistent sessions)");
     return {
       tool: { slack_status: slackStatusTool },
       dispose: async () => {
