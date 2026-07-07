@@ -78,6 +78,19 @@ process.on("message", async (msg) => {
     await addReaction(msg.channel, msg.name, msg.timestamp);
   } else if (msg?.type === "slack_reaction_remove") {
     try { await slack.reactions.remove({ channel: msg.channel, name: msg.name, timestamp: msg.timestamp }); } catch {}
+  } else if (msg?.type === "slack_upload") {
+    try {
+      await slack.filesUploadV2({
+        channel_id: msg.channel,
+        thread_ts: msg.threadTs,
+        content: msg.content,
+        filename: msg.filename || "response.md",
+        title: msg.title || "Response",
+      });
+    } catch (e) {
+      log(`upload error: ${e.message}`);
+      await sendToSlack(msg.channel, msg.content, msg.threadTs);
+    }
   }
 });
 

@@ -65,12 +65,39 @@ function saveSession(threadTs: string, sessionId: string, channel: string, direc
   saveSessions();
 }
 
+function markdownToSlackMrkdwn(text: string): string {
+  let result = text;
+  const codeBlocks: string[] = [];
+  result = result.replace(/```[\w]*\n([\s\S]*?)```/g, (_, code) => {
+    codeBlocks.push(code);
+    return `\x00CODEBLOCK${codeBlocks.length - 1}\x00`;
+  });
+  const inlineCodes: string[] = [];
+  result = result.replace(/`([^`]+)`/g, (_, code) => {
+    inlineCodes.push(code);
+    return `\x00INLINE${inlineCodes.length - 1}\x00`;
+  });
+  result = result.replace(/\[([^\]]+)\]\(([^)]+)\)/g, "<$2|$1>");
+  result = result.replace(/\*\*(.+?)\*\*/g, "*$1*");
+  result = result.replace(/^#{1,6}\s+(.+)$/gm, "*$1*");
+  result = result.replace(/\*\*+/g, "*");
+  result = result.replace(/~~(.+?)~~/g, "~$1~");
+  result = result.replace(/^(\s*)[-*]\s+/gm, "$1• ");
+  for (let i = 0; i < inlineCodes.length; i++) {
+    result = result.replace(`\x00INLINE${i}\x00`, `\`${inlineCodes[i]}\``);
+  }
+  for (let i = 0; i < codeBlocks.length; i++) {
+    result = result.replace(`\x00CODEBLOCK${i}\x00`, "```\n" + codeBlocks[i] + "```");
+  }
+  return result;
+}
+
 function sendIPC(msg: any) {
   if (worker && worker.connected) worker.send(msg);
 }
 
 function slackSend(channel: string, text: string, threadTs?: string) {
-  sendIPC({ type: "slack_send", channel, text, threadTs });
+  sendIPC({ type: "slack_send", channel, text: markdownToSlackMrkdwn(text), threadTs });
 }
 
 function slackUpdate(channel: string, ts: string, text: string) {
@@ -297,6 +324,25 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
           log(`session ${sessionId} idle via SSE`);
           break;
         }
+
+        if (evt.type === "todo.updated" && evt.properties?.sessionID === sessionId) {
+          const todos = evt.properties.todos || [];
+          if (todos.length > 0) {
+            let msg = "📋 *Plan*\n";
+            for (const t of todos) {
+              const icon = t.status === "completed" ? "✅" : t.status === "in_progress" ? "🔄" : "⬜";
+              msg += `${icon} ${t.content}\n`;
+            }
+            slackSend(channel, msg, threadTs);
+            log(`stream: todo.updated (${todos.length} items)`);
+          }
+        }
+
+        if (!["message.part.updated", "session.idle", "session.status", "todo.updated"].includes(evt.type)) {
+          if (evt.properties?.sessionID === sessionId || !evt.properties?.sessionID) {
+            log(`SSE event: ${evt.type} ${JSON.stringify(evt.properties || {}).slice(0, 100)}`);
+          }
+        }
       }
     } catch (streamErr: any) {
       log(`SSE error: ${streamErr.message}`);
@@ -349,15 +395,13 @@ function splitText(text: string): string[] {
 }
 
 function sendLongText(channel: string, text: string, threadTs?: string) {
-  if (text.length <= SLACK_MSG_LIMIT) {
-    slackSend(channel, text, threadTs);
+  const hasCodeBlock = text.includes("```");
+  log(`sendLongText: len=${text.length} hasCode=${hasCodeBlock}`);
+  if (text.length > SLACK_MSG_LIMIT || (hasCodeBlock && text.length > 2000)) {
+    sendIPC({ type: "slack_upload", channel, content: text, threadTs, filename: "response.md", title: "Response" });
     return;
   }
-  const chunks = splitText(text);
-  for (let i = 0; i < chunks.length; i++) {
-    const prefix = chunks.length > 1 ? `_(${i + 1}/${chunks.length})_\n` : "";
-    slackSend(channel, prefix + chunks[i], threadTs);
-  }
+  slackSend(channel, text, threadTs);
 }
 
 async function handleCommand(channel: string, text: string, ts: string): Promise<boolean> {

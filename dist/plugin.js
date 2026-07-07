@@ -12478,11 +12478,37 @@ function saveSession(threadTs, sessionId, channel, directory) {
   sessions[threadTs] = { sessionId, channel, lastUsed: Date.now(), ...directory ? { directory } : {} };
   saveSessions();
 }
+function markdownToSlackMrkdwn(text) {
+  let result = text;
+  const codeBlocks = [];
+  result = result.replace(/```[\w]*\n([\s\S]*?)```/g, (_, code) => {
+    codeBlocks.push(code);
+    return `\0CODEBLOCK${codeBlocks.length - 1}\0`;
+  });
+  const inlineCodes = [];
+  result = result.replace(/`([^`]+)`/g, (_, code) => {
+    inlineCodes.push(code);
+    return `\0INLINE${inlineCodes.length - 1}\0`;
+  });
+  result = result.replace(/\[([^\]]+)\]\(([^)]+)\)/g, "<$2|$1>");
+  result = result.replace(/\*\*(.+?)\*\*/g, "*$1*");
+  result = result.replace(/^#{1,6}\s+(.+)$/gm, "*$1*");
+  result = result.replace(/\*\*+/g, "*");
+  result = result.replace(/~~(.+?)~~/g, "~$1~");
+  result = result.replace(/^(\s*)[-*]\s+/gm, "$1\u2022 ");
+  for (let i = 0; i < inlineCodes.length; i++) {
+    result = result.replace(`\0INLINE${i}\0`, `\`${inlineCodes[i]}\``);
+  }
+  for (let i = 0; i < codeBlocks.length; i++) {
+    result = result.replace(`\0CODEBLOCK${i}\0`, "```\n" + codeBlocks[i] + "```");
+  }
+  return result;
+}
 function sendIPC(msg) {
   if (worker && worker.connected) worker.send(msg);
 }
 function slackSend(channel, text, threadTs) {
-  sendIPC({ type: "slack_send", channel, text, threadTs });
+  sendIPC({ type: "slack_send", channel, text: markdownToSlackMrkdwn(text), threadTs });
 }
 function findPendingPermissionForThread(threadTs) {
   for (const [key, perm] of pendingPermissions) {
@@ -12678,6 +12704,24 @@ ${q.question}
           log(`session ${sessionId} idle via SSE`);
           break;
         }
+        if (evt.type === "todo.updated" && evt.properties?.sessionID === sessionId) {
+          const todos = evt.properties.todos || [];
+          if (todos.length > 0) {
+            let msg = "\u{1F4CB} *Plan*\n";
+            for (const t of todos) {
+              const icon = t.status === "completed" ? "\u2705" : t.status === "in_progress" ? "\u{1F504}" : "\u2B1C";
+              msg += `${icon} ${t.content}
+`;
+            }
+            slackSend(channel, msg, threadTs);
+            log(`stream: todo.updated (${todos.length} items)`);
+          }
+        }
+        if (!["message.part.updated", "session.idle", "session.status", "todo.updated"].includes(evt.type)) {
+          if (evt.properties?.sessionID === sessionId || !evt.properties?.sessionID) {
+            log(`SSE event: ${evt.type} ${JSON.stringify(evt.properties || {}).slice(0, 100)}`);
+          }
+        }
       }
     } catch (streamErr) {
       log(`SSE error: ${streamErr.message}`);
@@ -12707,32 +12751,14 @@ ${q.question}
     slackSend(channel, `\u274C \uC624\uB958: ${e.message}`, ts);
   }
 }
-function splitText(text) {
-  const chunks = [];
-  const lines = text.split("\n");
-  let current = "";
-  for (const line of lines) {
-    if (current.length + line.length + 1 > SLACK_MSG_LIMIT) {
-      chunks.push(current);
-      current = line;
-    } else {
-      current = current ? current + "\n" + line : line;
-    }
-  }
-  if (current) chunks.push(current);
-  return chunks;
-}
 function sendLongText(channel, text, threadTs) {
-  if (text.length <= SLACK_MSG_LIMIT) {
-    slackSend(channel, text, threadTs);
+  const hasCodeBlock = text.includes("```");
+  log(`sendLongText: len=${text.length} hasCode=${hasCodeBlock}`);
+  if (text.length > SLACK_MSG_LIMIT || hasCodeBlock && text.length > 2e3) {
+    sendIPC({ type: "slack_upload", channel, content: text, threadTs, filename: "response.md", title: "Response" });
     return;
   }
-  const chunks = splitText(text);
-  for (let i = 0; i < chunks.length; i++) {
-    const prefix = chunks.length > 1 ? `_(${i + 1}/${chunks.length})_
-` : "";
-    slackSend(channel, prefix + chunks[i], threadTs);
-  }
+  slackSend(channel, text, threadTs);
 }
 async function handleCommand(channel, text, ts) {
   if (!pluginClient) return false;
