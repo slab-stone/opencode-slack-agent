@@ -42,11 +42,8 @@ Add plugin with tokens to `~/.config/opencode/opencode.json`:
 {
   "plugin": [
     ["opencode-slack-agent", {
-      "SLACK_AGENT_ENABLED": "true",
       "SLACK_BOT_TOKEN": "xoxb-...",
-      "SLACK_APP_TOKEN": "xapp-...",
-      "DEFAULT_DIRECTORY": "/path/to/project",
-      "NODE_EXTRA_CA_CERTS": "/path/to/certs.pem"
+      "SLACK_APP_TOKEN": "xapp-..."
     }]
   ]
 }
@@ -54,22 +51,14 @@ Add plugin with tokens to `~/.config/opencode/opencode.json`:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `SLACK_AGENT_ENABLED` | `"true"` | Set `"false"` to disable without removing config |
 | `SLACK_BOT_TOKEN` | — | Required. Bot token (`xoxb-...`) |
 | `SLACK_APP_TOKEN` | — | Required. App-level token (`xapp-...`) |
 | `DEFAULT_DIRECTORY` | serve directory | Default workspace for new sessions |
-| `NODE_EXTRA_CA_CERTS` | — | Custom CA certs (corporate proxy) |
 
 ### 4. Run
 
 ```bash
 opencode serve --port 4096
-```
-
-Or with env override:
-
-```bash
-SLACK_AGENT_ENABLED=true opencode serve --port 4096
 ```
 
 ## Features
@@ -135,8 +124,7 @@ This separation exists because Bun's embedded runtime doesn't reliably handle We
 ## Important
 
 - Only **one** Socket Mode connection per app token at a time
-- `SLACK_AGENT_ENABLED=false` in config to prevent accidental activation
-- Environment variable overrides config option (`SLACK_AGENT_ENABLED=true opencode serve`)
+- Environment variable `SLACK_AGENT_ENABLED=false` to disable without removing config
 
 ## Development
 
