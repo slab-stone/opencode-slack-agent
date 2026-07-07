@@ -12642,23 +12642,39 @@ async function handleMessage(channel, text, ts, messageTs, isAllowed = true) {
       sendIPC({ type: "slack_reaction_remove", channel, name: "peperun", timestamp: actualTs });
       return;
     }
+    let streamDone = false;
     const timeout = setTimeout(() => {
       log("SSE timeout (6min)");
+      streamDone = true;
       stream.return(void 0);
     }, 6 * 60 * 1e3);
+    const idleCheckStart = Date.now();
     const idleCheck = setInterval(async () => {
+      if (streamDone) {
+        clearInterval(idleCheck);
+        return;
+      }
+      if (Date.now() - idleCheckStart < 3e3) return;
       try {
-        const { data: status } = await pluginClient.session.status();
-        const sessionStatus = status?.[sessionId];
-        if (sessionStatus?.type === "idle") {
-          log(`session ${sessionId} idle via poll fallback`);
-          stream.return(void 0);
+        const { data: messages } = await pluginClient.session.messages({
+          path: { id: sessionId }
+        });
+        if (Array.isArray(messages)) {
+          const lastAssistant = [...messages].reverse().find(
+            (m) => m.info?.role === "assistant"
+          );
+          if (lastAssistant?.info?.time?.completed) {
+            log(`session ${sessionId} idle via poll fallback`);
+            streamDone = true;
+            stream.return(void 0);
+          }
         }
       } catch {
       }
     }, 5e3);
     try {
       for await (const event of stream) {
+        if (streamDone) break;
         if (!event || !event.type) continue;
         const evt = event;
         if (evt.type === "message.part.updated") {
@@ -12716,6 +12732,7 @@ ${q.question}
         }
         if (evt.type === "session.idle" && evt.properties?.sessionID === sessionId) {
           log(`session ${sessionId} idle via SSE`);
+          streamDone = true;
           break;
         }
         if (evt.type === "todo.updated" && evt.properties?.sessionID === sessionId) {
@@ -12740,6 +12757,7 @@ ${q.question}
     } catch (streamErr) {
       log(`SSE error: ${streamErr.message}`);
     } finally {
+      streamDone = true;
       clearTimeout(timeout);
       clearInterval(idleCheck);
     }

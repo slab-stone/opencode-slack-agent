@@ -255,24 +255,38 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
       return;
     }
 
+    let streamDone = false;
+
     const timeout = setTimeout(() => {
       log("SSE timeout (6min)");
+      streamDone = true;
       stream.return(undefined);
     }, 6 * 60 * 1000);
 
+    const idleCheckStart = Date.now();
     const idleCheck = setInterval(async () => {
+      if (streamDone) { clearInterval(idleCheck); return; }
+      if (Date.now() - idleCheckStart < 3000) return;
       try {
-        const { data: status } = await pluginClient!.session.status();
-        const sessionStatus = status?.[sessionId];
-        if (sessionStatus?.type === "idle") {
-          log(`session ${sessionId} idle via poll fallback`);
-          stream.return(undefined);
+        const { data: messages } = await pluginClient!.session.messages({
+          path: { id: sessionId },
+        });
+        if (Array.isArray(messages)) {
+          const lastAssistant = [...messages].reverse().find(
+            (m: any) => m.info?.role === "assistant"
+          );
+          if (lastAssistant?.info?.time?.completed) {
+            log(`session ${sessionId} idle via poll fallback`);
+            streamDone = true;
+            stream.return(undefined);
+          }
         }
       } catch {}
     }, 5000);
 
     try {
       for await (const event of stream) {
+        if (streamDone) break;
         if (!event || !(event as any).type) continue;
         const evt = event as any;
 
@@ -336,6 +350,7 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
 
         if (evt.type === "session.idle" && evt.properties?.sessionID === sessionId) {
           log(`session ${sessionId} idle via SSE`);
+          streamDone = true;
           break;
         }
 
@@ -361,6 +376,7 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
     } catch (streamErr: any) {
       log(`SSE error: ${streamErr.message}`);
     } finally {
+      streamDone = true;
       clearTimeout(timeout);
       clearInterval(idleCheck);
     }
