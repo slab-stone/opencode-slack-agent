@@ -12440,6 +12440,8 @@ var modelOverride = null;
 var sessionsPath = "";
 var sessions = {};
 var defaultDirectory = "";
+var pendingPermissions = /* @__PURE__ */ new Map();
+var pendingQuestions = /* @__PURE__ */ new Map();
 function log(m) {
   try {
     appendFileSync(LOG_FILE, `[${(/* @__PURE__ */ new Date()).toISOString()}] plugin: ${m}
@@ -12484,17 +12486,92 @@ function slackSend(channel, text, threadTs) {
 function slackUpdate(channel, ts, text) {
   sendIPC({ type: "slack_update", channel, ts, text });
 }
-async function handleMessage(channel, text, ts) {
+function findPendingPermissionForThread(threadTs) {
+  for (const [key, perm] of pendingPermissions) {
+    if (perm.threadTs === threadTs) {
+      if (Date.now() - perm.createdAt > 5 * 60 * 1e3) {
+        pendingPermissions.delete(key);
+        return null;
+      }
+      return perm;
+    }
+  }
+  return null;
+}
+async function handlePermissionReply(pending, text, channel, threadTs) {
   if (!pluginClient) return;
+  const trimmed = text.trim().toLowerCase();
+  let reply = null;
+  if (["1", "y", "yes", "once"].includes(trimmed)) reply = "once";
+  else if (["2", "always"].includes(trimmed)) reply = "always";
+  else if (["3", "n", "no", "reject"].includes(trimmed)) reply = "reject";
+  if (!reply) {
+    slackSend(channel, "_\uC798\uBABB\uB41C \uC751\uB2F5. 1/y/yes, 2/always, 3/n/no \uB85C \uB2F5\uD574\uC8FC\uC138\uC694._", threadTs);
+    return;
+  }
+  try {
+    await pluginClient.postSessionIdPermissionsPermissionId({
+      path: { id: pending.sessionId, permissionID: pending.permissionId },
+      body: { response: reply }
+    });
+    pendingPermissions.delete(pending.permissionId);
+    const label = reply === "reject" ? "\uAC70\uBD80" : `\uD5C8\uC6A9 (${reply})`;
+    slackSend(channel, `_\uAD8C\uD55C ${label}_`, threadTs);
+    log(`permission ${pending.permissionId} replied: ${reply}`);
+  } catch (e) {
+    pendingPermissions.delete(pending.permissionId);
+    slackSend(channel, `_\uAD8C\uD55C \uC751\uB2F5 \uC2E4\uD328: ${e.message}_`, threadTs);
+    log(`permission reply error: ${e.message}`);
+  }
+}
+function findPendingQuestionForThread(threadTs) {
+  for (const [key, q] of pendingQuestions) {
+    if (q.threadTs === threadTs) {
+      if (Date.now() - q.createdAt > 5 * 60 * 1e3) {
+        pendingQuestions.delete(key);
+        return null;
+      }
+      return q;
+    }
+  }
+  return null;
+}
+async function handleQuestionReply(pending, text, channel, threadTs) {
+  if (!pluginClient) return;
+  try {
+    await pluginClient.tui.control.response({
+      body: text.trim()
+    });
+    pendingQuestions.delete(threadTs);
+    log(`question replied: ${text.slice(0, 50)}`);
+  } catch (e) {
+    pendingQuestions.delete(threadTs);
+    slackSend(channel, `_\uC751\uB2F5 \uC804\uB2EC \uC2E4\uD328: ${e.message}_`, threadTs);
+    log(`question reply error: ${e.message}`);
+  }
+}
+async function handleMessage(channel, text, ts, messageTs) {
+  if (!pluginClient) return;
+  const actualTs = messageTs || ts;
   log(`handleMessage: ${text.slice(0, 50)}`);
   if (text.startsWith("!")) {
     const handled = await handleCommand(channel, text, ts);
     if (handled) return;
   }
+  const pending = findPendingPermissionForThread(ts);
+  if (pending) {
+    await handlePermissionReply(pending, text, channel, ts);
+    return;
+  }
+  const pendingQ = findPendingQuestionForThread(ts);
+  if (pendingQ) {
+    await handleQuestionReply(pendingQ, text, channel, ts);
+    return;
+  }
   try {
     const threadTs = ts;
     let sessionId = getSessionForThread(threadTs);
-    sendIPC({ type: "slack_reaction", channel, name: "peperun", timestamp: ts });
+    sendIPC({ type: "slack_reaction", channel, name: "peperun", timestamp: actualTs });
     if (!sessionId) {
       const directory = sessions[threadTs]?.directory || defaultDirectory;
       const { data: session } = await pluginClient.session.create({
@@ -12522,6 +12599,7 @@ async function handleMessage(channel, text, ts) {
     log("prompt sent");
     let streamMsgTs = null;
     let lastToolSeen = 0;
+    let questionPosted = false;
     for (let i = 0; i < 180; i++) {
       await new Promise((r) => setTimeout(r, 2e3));
       try {
@@ -12534,8 +12612,40 @@ async function handleMessage(channel, text, ts) {
         );
         if (!lastAssistant) continue;
         const parts = lastAssistant.parts;
+        const questionTool = parts.find(
+          (p) => p.type === "tool" && p.tool === "question" && p.state?.status === "running"
+        );
+        if (questionTool && !questionPosted) {
+          questionPosted = true;
+          const input = questionTool.state?.input || {};
+          const questions = input.questions || [];
+          let msg = "\u2753 *\uC9C8\uBB38*\n";
+          for (const q of questions) {
+            msg += `
+*${q.header || ""}*
+${q.question}
+`;
+            if (q.options?.length) {
+              q.options.forEach((opt, idx) => {
+                msg += `  *${idx + 1}.* ${opt.label}${opt.description ? ` \u2014 ${opt.description}` : ""}
+`;
+              });
+            }
+          }
+          msg += "\n_\uBC88\uD638 \uB610\uB294 \uD14D\uC2A4\uD2B8\uB85C \uB2F5\uD574\uC8FC\uC138\uC694_";
+          slackSend(channel, msg, threadTs);
+          pendingQuestions.set(threadTs, {
+            sessionId,
+            threadTs,
+            channel,
+            createdAt: Date.now()
+          });
+          log(`question forwarded to slack for thread ${threadTs}`);
+          sendIPC({ type: "slack_reaction_remove", channel, name: "peperun", timestamp: actualTs });
+          return;
+        }
         const activeParts = parts.filter(
-          (p) => p.type === "reasoning" || p.type === "tool" && (p.state?.status === "running" || p.state?.status === "completed")
+          (p) => p.type === "reasoning" || p.type === "tool" && p.tool !== "question" && (p.state?.status === "running" || p.state?.status === "completed")
         );
         if (activeParts.length > lastToolSeen) {
           lastToolSeen = activeParts.length;
@@ -12561,7 +12671,7 @@ async function handleMessage(channel, text, ts) {
         if (textParts) {
           sendLongText(channel, textParts, threadTs);
         }
-        sendIPC({ type: "slack_reaction_remove", channel, name: "peperun", timestamp: ts });
+        sendIPC({ type: "slack_reaction_remove", channel, name: "peperun", timestamp: actualTs });
         log(`session ${sessionId} completed`);
         return;
       } catch (pollErr) {
@@ -12710,7 +12820,7 @@ function startWorker(env) {
   });
   worker.on("message", (msg) => {
     if (msg?.type === "slack_event") {
-      handleMessage(msg.channel, msg.text, msg.threadTs);
+      handleMessage(msg.channel, msg.text, msg.threadTs, msg.messageTs);
     }
   });
   worker.on("exit", (code) => {
@@ -12776,6 +12886,33 @@ var pluginModule = {
     log("plugin initialized (hybrid sidecar + persistent sessions)");
     return {
       tool: { slack_status: slackStatusTool },
+      "permission.ask": async (input2, output) => {
+        const sessionEntry = Object.entries(sessions).find(
+          ([_, s]) => s.sessionId === input2.sessionID
+        );
+        if (!sessionEntry) return;
+        const [threadTs, session] = sessionEntry;
+        pendingPermissions.set(input2.id, {
+          permissionId: input2.id,
+          sessionId: input2.sessionID,
+          threadTs,
+          channel: session.channel,
+          createdAt: Date.now()
+        });
+        let msg = "\u26A0\uFE0F *\uAD8C\uD55C \uC694\uCCAD*\n";
+        msg += `\`${input2.title}\`
+`;
+        if (input2.pattern) {
+          const patterns = Array.isArray(input2.pattern) ? input2.pattern.join(", ") : input2.pattern;
+          msg += `\uD328\uD134: \`${patterns}\`
+`;
+        }
+        msg += "\n*1.* \uD5C8\uC6A9 (\uC774\uBC88\uB9CC)\n*2.* \uD56D\uC0C1 \uD5C8\uC6A9\n*3.* \uAC70\uBD80\n";
+        msg += "_1/y/yes, 2/always, 3/n/no \uB85C \uB2F5\uD574\uC8FC\uC138\uC694_";
+        slackSend(session.channel, msg, threadTs);
+        log(`permission.ask forwarded to slack: ${input2.id} (${input2.title})`);
+        output.status = "ask";
+      },
       dispose: async () => {
         stopWorker();
         pluginClient = null;

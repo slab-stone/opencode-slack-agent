@@ -16,6 +16,23 @@ let sessionsPath: string = "";
 let sessions: Record<string, { sessionId: string; channel: string; lastUsed: number; directory?: string }> = {};
 let defaultDirectory: string = "";
 
+type PendingPermission = {
+  permissionId: string;
+  sessionId: string;
+  threadTs: string;
+  channel: string;
+  createdAt: number;
+};
+let pendingPermissions: Map<string, PendingPermission> = new Map();
+
+type PendingQuestion = {
+  sessionId: string;
+  threadTs: string;
+  channel: string;
+  createdAt: number;
+};
+let pendingQuestions: Map<string, PendingQuestion> = new Map();
+
 function log(m: string) {
   try { appendFileSync(LOG_FILE, `[${new Date().toISOString()}] plugin: ${m}\n`); } catch {}
 }
@@ -59,8 +76,79 @@ function slackUpdate(channel: string, ts: string, text: string) {
   sendIPC({ type: "slack_update", channel, ts, text });
 }
 
-async function handleMessage(channel: string, text: string, ts: string) {
+function findPendingPermissionForThread(threadTs: string): PendingPermission | null {
+  for (const [key, perm] of pendingPermissions) {
+    if (perm.threadTs === threadTs) {
+      if (Date.now() - perm.createdAt > 5 * 60 * 1000) {
+        pendingPermissions.delete(key);
+        return null;
+      }
+      return perm;
+    }
+  }
+  return null;
+}
+
+async function handlePermissionReply(pending: PendingPermission, text: string, channel: string, threadTs: string) {
   if (!pluginClient) return;
+  const trimmed = text.trim().toLowerCase();
+  let reply: "once" | "always" | "reject" | null = null;
+  if (["1", "y", "yes", "once"].includes(trimmed)) reply = "once";
+  else if (["2", "always"].includes(trimmed)) reply = "always";
+  else if (["3", "n", "no", "reject"].includes(trimmed)) reply = "reject";
+
+  if (!reply) {
+    slackSend(channel, "_잘못된 응답. 1/y/yes, 2/always, 3/n/no 로 답해주세요._", threadTs);
+    return;
+  }
+
+  try {
+    await pluginClient.postSessionIdPermissionsPermissionId({
+      path: { id: pending.sessionId, permissionID: pending.permissionId },
+      body: { response: reply },
+    });
+    pendingPermissions.delete(pending.permissionId);
+    const label = reply === "reject" ? "거부" : `허용 (${reply})`;
+    slackSend(channel, `_권한 ${label}_`, threadTs);
+    log(`permission ${pending.permissionId} replied: ${reply}`);
+  } catch (e: any) {
+    pendingPermissions.delete(pending.permissionId);
+    slackSend(channel, `_권한 응답 실패: ${e.message}_`, threadTs);
+    log(`permission reply error: ${e.message}`);
+  }
+}
+
+function findPendingQuestionForThread(threadTs: string): PendingQuestion | null {
+  for (const [key, q] of pendingQuestions) {
+    if (q.threadTs === threadTs) {
+      if (Date.now() - q.createdAt > 5 * 60 * 1000) {
+        pendingQuestions.delete(key);
+        return null;
+      }
+      return q;
+    }
+  }
+  return null;
+}
+
+async function handleQuestionReply(pending: PendingQuestion, text: string, channel: string, threadTs: string) {
+  if (!pluginClient) return;
+  try {
+    await pluginClient.tui.control.response({
+      body: text.trim(),
+    });
+    pendingQuestions.delete(threadTs);
+    log(`question replied: ${text.slice(0, 50)}`);
+  } catch (e: any) {
+    pendingQuestions.delete(threadTs);
+    slackSend(channel, `_응답 전달 실패: ${e.message}_`, threadTs);
+    log(`question reply error: ${e.message}`);
+  }
+}
+
+async function handleMessage(channel: string, text: string, ts: string, messageTs?: string) {
+  if (!pluginClient) return;
+  const actualTs = messageTs || ts;
   log(`handleMessage: ${text.slice(0, 50)}`);
 
   if (text.startsWith("!")) {
@@ -68,11 +156,23 @@ async function handleMessage(channel: string, text: string, ts: string) {
     if (handled) return;
   }
 
+  const pending = findPendingPermissionForThread(ts);
+  if (pending) {
+    await handlePermissionReply(pending, text, channel, ts);
+    return;
+  }
+
+  const pendingQ = findPendingQuestionForThread(ts);
+  if (pendingQ) {
+    await handleQuestionReply(pendingQ, text, channel, ts);
+    return;
+  }
+
   try {
     const threadTs = ts;
     let sessionId = getSessionForThread(threadTs);
 
-    sendIPC({ type: "slack_reaction", channel, name: "peperun", timestamp: ts });
+    sendIPC({ type: "slack_reaction", channel, name: "peperun", timestamp: actualTs });
 
     if (!sessionId) {
       const directory = sessions[threadTs]?.directory || defaultDirectory;
@@ -104,6 +204,7 @@ async function handleMessage(channel: string, text: string, ts: string) {
 
     let streamMsgTs: string | null = null;
     let lastToolSeen = 0;
+    let questionPosted = false;
 
     for (let i = 0; i < 180; i++) {
       await new Promise(r => setTimeout(r, 2000));
@@ -119,9 +220,38 @@ async function handleMessage(channel: string, text: string, ts: string) {
 
         const parts = lastAssistant.parts as any[];
 
+        const questionTool = parts.find((p: any) =>
+          p.type === "tool" && p.tool === "question" && p.state?.status === "running"
+        );
+        if (questionTool && !questionPosted) {
+          questionPosted = true;
+          const input = questionTool.state?.input || {};
+          const questions = input.questions || [];
+          let msg = "❓ *질문*\n";
+          for (const q of questions) {
+            msg += `\n*${q.header || ""}*\n${q.question}\n`;
+            if (q.options?.length) {
+              q.options.forEach((opt: any, idx: number) => {
+                msg += `  *${idx + 1}.* ${opt.label}${opt.description ? ` — ${opt.description}` : ""}\n`;
+              });
+            }
+          }
+          msg += "\n_번호 또는 텍스트로 답해주세요_";
+          slackSend(channel, msg, threadTs);
+          pendingQuestions.set(threadTs, {
+            sessionId,
+            threadTs,
+            channel,
+            createdAt: Date.now(),
+          });
+          log(`question forwarded to slack for thread ${threadTs}`);
+          sendIPC({ type: "slack_reaction_remove", channel, name: "peperun", timestamp: actualTs });
+          return;
+        }
+
         const activeParts = parts.filter((p: any) =>
           p.type === "reasoning" ||
-          (p.type === "tool" && (p.state?.status === "running" || p.state?.status === "completed"))
+          (p.type === "tool" && p.tool !== "question" && (p.state?.status === "running" || p.state?.status === "completed"))
         );
         if (activeParts.length > lastToolSeen) {
           lastToolSeen = activeParts.length;
@@ -153,7 +283,7 @@ async function handleMessage(channel: string, text: string, ts: string) {
         if (textParts) {
           sendLongText(channel, textParts, threadTs);
         }
-        sendIPC({ type: "slack_reaction_remove", channel, name: "peperun", timestamp: ts });
+        sendIPC({ type: "slack_reaction_remove", channel, name: "peperun", timestamp: actualTs });
         log(`session ${sessionId} completed`);
         return;
       } catch (pollErr: any) {
@@ -313,7 +443,7 @@ function startWorker(env: Record<string, string>) {
 
   worker.on("message", (msg: any) => {
     if (msg?.type === "slack_event") {
-      handleMessage(msg.channel, msg.text, msg.threadTs);
+      handleMessage(msg.channel, msg.text, msg.threadTs, msg.messageTs);
     }
   });
 
@@ -390,6 +520,35 @@ const pluginModule: PluginModule = {
 
     return {
       tool: { slack_status: slackStatusTool },
+      "permission.ask": async (input: any, output: any) => {
+        const sessionEntry = Object.entries(sessions).find(
+          ([_, s]) => s.sessionId === input.sessionID
+        );
+        if (!sessionEntry) return;
+        const [threadTs, session] = sessionEntry;
+
+        pendingPermissions.set(input.id, {
+          permissionId: input.id,
+          sessionId: input.sessionID,
+          threadTs,
+          channel: session.channel,
+          createdAt: Date.now(),
+        });
+
+        let msg = "⚠️ *권한 요청*\n";
+        msg += `\`${input.title}\`\n`;
+        if (input.pattern) {
+          const patterns = Array.isArray(input.pattern) ? input.pattern.join(", ") : input.pattern;
+          msg += `패턴: \`${patterns}\`\n`;
+        }
+        msg += "\n*1.* 허용 (이번만)\n*2.* 항상 허용\n*3.* 거부\n";
+        msg += "_1/y/yes, 2/always, 3/n/no 로 답해주세요_";
+
+        slackSend(session.channel, msg, threadTs);
+        log(`permission.ask forwarded to slack: ${input.id} (${input.title})`);
+
+        output.status = "ask";
+      },
       dispose: async () => {
         stopWorker();
         pluginClient = null;
