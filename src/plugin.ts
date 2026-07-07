@@ -12,6 +12,7 @@ let initialized = false;
 let worker: ChildProcess | null = null;
 let pluginClient: PluginInput["client"] | null = null;
 let modelOverride: { providerID: string; modelID: string } | null = null;
+let agentOverride: string | null = null;
 let sessionsPath: string = "";
 let sessions: Record<string, { sessionId: string; channel: string; lastUsed: number; directory?: string }> = {};
 let defaultDirectory: string = "";
@@ -191,10 +192,19 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
       log(`existing session: ${sessionId} for thread ${threadTs}`);
     }
 
+    let promptText = text;
+    let promptAgent = agentOverride;
+    const agentMatch = text.match(/^@(\S+)\s+([\s\S]*)$/);
+    if (agentMatch) {
+      promptAgent = agentMatch[1];
+      promptText = agentMatch[2].trim();
+    }
+
     const promptBody: any = {
-      parts: [{ type: "text" as const, text }],
+      parts: [{ type: "text" as const, text: promptText }],
     };
     if (modelOverride) promptBody.model = modelOverride;
+    if (promptAgent) promptBody.agent = promptAgent;
 
     await pluginClient.session.promptAsync({
       path: { id: sessionId },
@@ -250,7 +260,8 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
         }
 
         const activeParts = parts.filter((p: any) =>
-          p.type === "reasoning" ||
+          (p.type === "reasoning") ||
+          (p.type === "text" && p.text && !lastAssistant.info?.time?.completed) ||
           (p.type === "tool" && p.tool !== "question" && (p.state?.status === "running" || p.state?.status === "completed"))
         );
         if (activeParts.length > lastToolSeen) {
@@ -260,16 +271,16 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
           if (latest.type === "reasoning" && latest.text) {
             const snippet = latest.text.length > 200 ? latest.text.slice(0, 200) + "…" : latest.text;
             statusText = `💭 ${snippet}`;
+          } else if (latest.type === "text" && latest.text) {
+            const snippet = latest.text.length > 200 ? latest.text.slice(0, 200) + "…" : latest.text;
+            statusText = `💬 ${snippet}`;
           } else if (latest.type === "tool") {
             const title = latest.state?.title || latest.tool || "";
             if (title) statusText = `🔧 _${title}_`;
           }
           if (statusText) {
-            if (streamMsgTs) {
-              slackUpdate(channel, streamMsgTs, statusText);
-            } else {
-              slackSend(channel, statusText, threadTs);
-            }
+            slackSend(channel, statusText, threadTs);
+            log(`stream: ${statusText.slice(0, 50)}`);
           }
         }
 
@@ -374,6 +385,22 @@ async function handleCommand(channel: string, text: string, ts: string): Promise
     return true;
   }
 
+  if (cmd === "!agent") {
+    const arg = parts.slice(1).join(" ").trim();
+    if (!arg) {
+      slackSend(channel, `*현재 에이전트:* \`${agentOverride || "(default)"}\``, ts);
+      return true;
+    }
+    if (arg === "reset" || arg === "default") {
+      agentOverride = null;
+      slackSend(channel, "✅ 기본 에이전트로 복원", ts);
+      return true;
+    }
+    agentOverride = arg;
+    slackSend(channel, `✅ 에이전트 변경: \`${arg}\``, ts);
+    return true;
+  }
+
   if (cmd === "!dir") {
     const arg = parts.slice(1).join(" ").trim();
     if (!arg) {
@@ -418,6 +445,9 @@ async function handleCommand(channel: string, text: string, ts: string): Promise
       "• `!model` — 현재 모델 확인 / 변경",
       "• `!model provider/model` — 모델 변경",
       "• `!model reset` — 기본 모델 복원",
+      "• `!agent` — 현재 에이전트 확인",
+      "• `!agent build` — 에이전트 변경 (build, plan 등)",
+      "• `!agent reset` — 기본 에이전트 복원",
       "• `!dir` — 현재 워크스페이스 확인",
       "• `!dir /path/to/project` — 워크스페이스 변경",
       "• `!attach ses_xxx` — 기존 세션 연결 (URL 붙여넣기 가능)",

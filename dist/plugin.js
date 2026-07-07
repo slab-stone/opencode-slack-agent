@@ -12437,6 +12437,7 @@ var initialized = false;
 var worker = null;
 var pluginClient = null;
 var modelOverride = null;
+var agentOverride = null;
 var sessionsPath = "";
 var sessions = {};
 var defaultDirectory = "";
@@ -12482,9 +12483,6 @@ function sendIPC(msg) {
 }
 function slackSend(channel, text, threadTs) {
   sendIPC({ type: "slack_send", channel, text, threadTs });
-}
-function slackUpdate(channel, ts, text) {
-  sendIPC({ type: "slack_update", channel, ts, text });
 }
 function findPendingPermissionForThread(threadTs) {
   for (const [key, perm] of pendingPermissions) {
@@ -12588,10 +12586,18 @@ async function handleMessage(channel, text, ts, messageTs) {
     } else {
       log(`existing session: ${sessionId} for thread ${threadTs}`);
     }
+    let promptText = text;
+    let promptAgent = agentOverride;
+    const agentMatch = text.match(/^@(\S+)\s+([\s\S]*)$/);
+    if (agentMatch) {
+      promptAgent = agentMatch[1];
+      promptText = agentMatch[2].trim();
+    }
     const promptBody = {
-      parts: [{ type: "text", text }]
+      parts: [{ type: "text", text: promptText }]
     };
     if (modelOverride) promptBody.model = modelOverride;
+    if (promptAgent) promptBody.agent = promptAgent;
     await pluginClient.session.promptAsync({
       path: { id: sessionId },
       body: promptBody
@@ -12645,7 +12651,7 @@ ${q.question}
           return;
         }
         const activeParts = parts.filter(
-          (p) => p.type === "reasoning" || p.type === "tool" && p.tool !== "question" && (p.state?.status === "running" || p.state?.status === "completed")
+          (p) => p.type === "reasoning" || p.type === "text" && p.text && !lastAssistant.info?.time?.completed || p.type === "tool" && p.tool !== "question" && (p.state?.status === "running" || p.state?.status === "completed")
         );
         if (activeParts.length > lastToolSeen) {
           lastToolSeen = activeParts.length;
@@ -12654,16 +12660,16 @@ ${q.question}
           if (latest.type === "reasoning" && latest.text) {
             const snippet = latest.text.length > 200 ? latest.text.slice(0, 200) + "\u2026" : latest.text;
             statusText = `\u{1F4AD} ${snippet}`;
+          } else if (latest.type === "text" && latest.text) {
+            const snippet = latest.text.length > 200 ? latest.text.slice(0, 200) + "\u2026" : latest.text;
+            statusText = `\u{1F4AC} ${snippet}`;
           } else if (latest.type === "tool") {
             const title = latest.state?.title || latest.tool || "";
             if (title) statusText = `\u{1F527} _${title}_`;
           }
           if (statusText) {
-            if (streamMsgTs) {
-              slackUpdate(channel, streamMsgTs, statusText);
-            } else {
-              slackSend(channel, statusText, threadTs);
-            }
+            slackSend(channel, statusText, threadTs);
+            log(`stream: ${statusText.slice(0, 50)}`);
           }
         }
         if (!lastAssistant.info?.time?.completed) continue;
@@ -12755,6 +12761,21 @@ async function handleCommand(channel, text, ts) {
     slackSend(channel, "\u2705 \uC138\uC158 \uB9AC\uC14B\uB428. \uB2E4\uC74C \uBA54\uC2DC\uC9C0\uBD80\uD130 \uC0C8 \uC138\uC158.", ts);
     return true;
   }
+  if (cmd === "!agent") {
+    const arg = parts.slice(1).join(" ").trim();
+    if (!arg) {
+      slackSend(channel, `*\uD604\uC7AC \uC5D0\uC774\uC804\uD2B8:* \`${agentOverride || "(default)"}\``, ts);
+      return true;
+    }
+    if (arg === "reset" || arg === "default") {
+      agentOverride = null;
+      slackSend(channel, "\u2705 \uAE30\uBCF8 \uC5D0\uC774\uC804\uD2B8\uB85C \uBCF5\uC6D0", ts);
+      return true;
+    }
+    agentOverride = arg;
+    slackSend(channel, `\u2705 \uC5D0\uC774\uC804\uD2B8 \uBCC0\uACBD: \`${arg}\``, ts);
+    return true;
+  }
   if (cmd === "!dir") {
     const arg = parts.slice(1).join(" ").trim();
     if (!arg) {
@@ -12799,6 +12820,9 @@ async function handleCommand(channel, text, ts) {
       "\u2022 `!model` \u2014 \uD604\uC7AC \uBAA8\uB378 \uD655\uC778 / \uBCC0\uACBD",
       "\u2022 `!model provider/model` \u2014 \uBAA8\uB378 \uBCC0\uACBD",
       "\u2022 `!model reset` \u2014 \uAE30\uBCF8 \uBAA8\uB378 \uBCF5\uC6D0",
+      "\u2022 `!agent` \u2014 \uD604\uC7AC \uC5D0\uC774\uC804\uD2B8 \uD655\uC778",
+      "\u2022 `!agent build` \u2014 \uC5D0\uC774\uC804\uD2B8 \uBCC0\uACBD (build, plan \uB4F1)",
+      "\u2022 `!agent reset` \u2014 \uAE30\uBCF8 \uC5D0\uC774\uC804\uD2B8 \uBCF5\uC6D0",
       "\u2022 `!dir` \u2014 \uD604\uC7AC \uC6CC\uD06C\uC2A4\uD398\uC774\uC2A4 \uD655\uC778",
       "\u2022 `!dir /path/to/project` \u2014 \uC6CC\uD06C\uC2A4\uD398\uC774\uC2A4 \uBCC0\uACBD",
       "\u2022 `!attach ses_xxx` \u2014 \uAE30\uC874 \uC138\uC158 \uC5F0\uACB0 (URL \uBD99\uC5EC\uB123\uAE30 \uAC00\uB2A5)",
