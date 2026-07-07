@@ -7,10 +7,12 @@ OpenCode plugin that connects Slack to your AI agent. Receives DMs and @mentions
 ```
 opencode serve
   └─ [plugin: opencode-slack-agent]
-       ├─ Socket Mode (real-time Slack events, in-process)
-       ├─ DM or @mention received
-       │    └─ Creates OpenCode session via plugin client → AI processes
-       └─ Sends response back to Slack
+       ├─ Plugin (Bun) — session management, OpenCode client, IPC
+       └─ Socket Worker (Node) — Slack Socket Mode, message delivery
+            ├─ DM or @mention received → IPC → plugin
+            ├─ Plugin creates/reuses OpenCode session
+            ├─ Streams tool progress (🔧) to Slack thread
+            └─ Sends final response (or uploads file for long responses)
 ```
 
 ## Setup
@@ -40,12 +42,23 @@ Add plugin with tokens to `~/.config/opencode/opencode.json`:
 {
   "plugin": [
     ["opencode-slack-agent", {
+      "SLACK_AGENT_ENABLED": "true",
       "SLACK_BOT_TOKEN": "xoxb-...",
-      "SLACK_APP_TOKEN": "xapp-..."
+      "SLACK_APP_TOKEN": "xapp-...",
+      "DEFAULT_DIRECTORY": "/path/to/project",
+      "NODE_EXTRA_CA_CERTS": "/path/to/certs.pem"
     }]
   ]
 }
 ```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `SLACK_AGENT_ENABLED` | `"true"` | Set `"false"` to disable without removing config |
+| `SLACK_BOT_TOKEN` | — | Required. Bot token (`xoxb-...`) |
+| `SLACK_APP_TOKEN` | — | Required. App-level token (`xapp-...`) |
+| `DEFAULT_DIRECTORY` | serve directory | Default workspace for new sessions |
+| `NODE_EXTRA_CA_CERTS` | — | Custom CA certs (corporate proxy) |
 
 ### 4. Run
 
@@ -53,31 +66,77 @@ Add plugin with tokens to `~/.config/opencode/opencode.json`:
 opencode serve --port 4096
 ```
 
-The plugin loads automatically and starts Socket Mode in-process. Send a DM to your bot or @mention it in any channel.
+Or with env override:
 
-## Behavior
+```bash
+SLACK_AGENT_ENABLED=true opencode serve --port 4096
+```
 
-- **DM**: Bot responds to all direct messages
-- **@mention**: Bot responds when mentioned in channels
-- **Progress**: Shows 👀 reaction on receipt, sends "처리 중..." in thread, ✅ on completion
-- **Long messages**: Auto-split into chunks
-- **Commands**: `!model` to list/switch models
+## Features
+
+### Thread-based Sessions (persistent)
+- Each Slack thread = one OpenCode session
+- Session persists across server restarts (`slack-sessions.json`)
+- Thread replies continue the same conversation with full context
+
+### Multi-Agent Support
+- `@build fix the bug` — use specific agent per message
+- `@plan analyze this project` — plan mode
+- `@oracle review this design` — read-only consultation
+- No prefix → uses default or `!agent` setting
+
+### Real-time Streaming
+- 🔧 Tool execution status shown in thread
+- 💭 Reasoning/thinking (when model supports it)
+- 📋 Todo/plan updates forwarded to Slack
+
+### Long Response Handling
+- Responses > 3900 chars or with code blocks > 2000 chars → file upload (snippet)
+- Markdown automatically converted to Slack mrkdwn format
+
+### Permission & Question Forwarding
+- Agent permission requests → forwarded to Slack thread (1/2/3 to allow/always/reject)
+- Agent questions → forwarded with options, reply to answer
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `!help` | Show all commands |
+| `!model` | Show current model |
+| `!model provider/model` | Switch model |
+| `!model reset` | Restore default model |
+| `!agent` | Show current agent |
+| `!agent build` | Switch agent |
+| `!agent reset` | Restore default agent |
+| `!dir` | Show current workspace |
+| `!dir /path/to/project` | Change workspace |
+| `!attach ses_xxx` | Attach existing session (URL paste supported) |
+| `!reset` | Reset current thread session |
 
 ## Architecture
 
-The plugin runs entirely in-process within OpenCode's runtime:
+Hybrid sidecar pattern:
 
-1. **Plugin** loads inside `opencode serve`
-2. **Slack SDK** is bundled with tsup (noExternal) for Bun compatibility
-3. **OpenCode client** is accessed directly via `PluginInput.client` (no HTTP hop)
-4. **Socket Mode** WebSocket connection is managed within the plugin lifecycle
+1. **Plugin** (runs in OpenCode's Bun runtime)
+   - Manages sessions via `PluginInput.client` (no HTTP)
+   - Persistent session map (JSON file)
+   - Permission/question handling
+   - Markdown → Slack mrkdwn conversion
+   - SSE event streaming for real-time updates
 
-No external processes, no lock files, no zombie process issues.
+2. **Socket Worker** (spawned Node.js process)
+   - Maintains Slack Socket Mode WebSocket (reliable in Node)
+   - Handles `chat.postMessage`, `reactions`, `files.uploadV2`
+   - Communicates with plugin via IPC
+
+This separation exists because Bun's embedded runtime doesn't reliably handle WebSocket reconnections for Socket Mode.
 
 ## Important
 
-- Only **one** Socket Mode connection should exist per app token at a time
-- If running OpenCode.app and CLI serve simultaneously, only one should have the plugin active
+- Only **one** Socket Mode connection per app token at a time
+- `SLACK_AGENT_ENABLED=false` in config to prevent accidental activation
+- Environment variable overrides config option (`SLACK_AGENT_ENABLED=true opencode serve`)
 
 ## Development
 
