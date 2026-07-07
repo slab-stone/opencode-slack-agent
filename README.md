@@ -54,7 +54,7 @@ Add plugin with tokens to `~/.config/opencode/opencode.json`:
 | `SLACK_BOT_TOKEN` | — | Required. Bot token (`xoxb-...`) |
 | `SLACK_APP_TOKEN` | — | Required. App-level token (`xapp-...`) |
 | `DEFAULT_DIRECTORY` | serve directory | Default workspace for new sessions |
-| `ALLOWED_USERS` | — | Comma-separated Slack user IDs. If unset, everyone can use the bot |
+| `ALLOWED_USERS` | — | Comma-separated Slack user IDs or emails. If unset, everyone can use the bot |
 
 ### 4. Run
 

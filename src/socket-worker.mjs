@@ -91,6 +91,17 @@ process.on("message", async (msg) => {
       log(`upload error: ${e.message}`);
       await sendToSlack(msg.channel, msg.content, msg.threadTs);
     }
+  } else if (msg?.type === "resolve_emails") {
+    const resolved = [];
+    for (const email of msg.emails || []) {
+      try {
+        const result = await slack.users.lookupByEmail({ email });
+        if (result?.user?.id) resolved.push(result.user.id);
+      } catch {}
+    }
+    if (resolved.length > 0 && process.send) {
+      process.send({ type: "resolved_emails", users: resolved });
+    }
   }
 });
 

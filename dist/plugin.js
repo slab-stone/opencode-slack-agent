@@ -12893,6 +12893,13 @@ function startWorker(env) {
         return;
       }
       handleMessage(msg.channel, msg.text, msg.threadTs, msg.messageTs);
+    } else if (msg?.type === "resolved_emails") {
+      if (allowedUsers && msg.users) {
+        for (const uid of msg.users) {
+          allowedUsers.add(uid);
+        }
+        log(`resolved email users: ${msg.users.join(", ")}`);
+      }
     }
   });
   worker.on("exit", (code) => {
@@ -12949,8 +12956,13 @@ var pluginModule = {
     log(`sessions loaded: ${Object.keys(sessions).length} entries from ${sessionsPath}`);
     const allowedUsersStr = options?.ALLOWED_USERS || process.env.SLACK_ALLOWED_USERS || "";
     if (allowedUsersStr) {
-      allowedUsers = new Set(allowedUsersStr.split(",").map((u) => u.trim()).filter(Boolean));
-      log(`allowed users: ${[...allowedUsers].join(", ")}`);
+      const entries = allowedUsersStr.split(",").map((u) => u.trim()).filter(Boolean);
+      allowedUsers = new Set(entries.filter((e) => e.startsWith("U")));
+      const emails = entries.filter((e) => e.includes("@"));
+      if (emails.length > 0) {
+        sendIPC({ type: "resolve_emails", emails });
+      }
+      log(`allowed users: ${[...allowedUsers].join(", ")}${emails.length ? ` + ${emails.length} emails to resolve` : ""}`);
     }
     const workerEnv = {
       SLACK_BOT_TOKEN: botToken,
