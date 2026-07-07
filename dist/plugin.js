@@ -12441,6 +12441,7 @@ var agentOverride = null;
 var sessionsPath = "";
 var sessions = {};
 var defaultDirectory = "";
+var allowedUsers = null;
 var pendingPermissions = /* @__PURE__ */ new Map();
 var pendingQuestions = /* @__PURE__ */ new Map();
 function log(m) {
@@ -12887,6 +12888,10 @@ function startWorker(env) {
   });
   worker.on("message", (msg) => {
     if (msg?.type === "slack_event") {
+      if (allowedUsers && !allowedUsers.has(msg.user)) {
+        log(`blocked user: ${msg.user}`);
+        return;
+      }
       handleMessage(msg.channel, msg.text, msg.threadTs, msg.messageTs);
     }
   });
@@ -12942,6 +12947,11 @@ var pluginModule = {
     sessionsPath = join(input.directory, "slack-sessions.json");
     loadSessions();
     log(`sessions loaded: ${Object.keys(sessions).length} entries from ${sessionsPath}`);
+    const allowedUsersStr = options?.ALLOWED_USERS || process.env.SLACK_ALLOWED_USERS || "";
+    if (allowedUsersStr) {
+      allowedUsers = new Set(allowedUsersStr.split(",").map((u) => u.trim()).filter(Boolean));
+      log(`allowed users: ${[...allowedUsers].join(", ")}`);
+    }
     const workerEnv = {
       SLACK_BOT_TOKEN: botToken,
       SLACK_APP_TOKEN: appToken

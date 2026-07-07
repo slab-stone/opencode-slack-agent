@@ -109,7 +109,7 @@ socketClient.on("slack_event", async ({ body, ack }) => {
       : ev.text;
 
     if (text && process.send) {
-      process.send({ type: "slack_event", channel: ev.channel, text, ts: ev.ts, threadTs: ev.thread_ts || ev.ts, messageTs: ev.ts });
+      process.send({ type: "slack_event", channel: ev.channel, text, ts: ev.ts, threadTs: ev.thread_ts || ev.ts, messageTs: ev.ts, user: ev.user });
       log(`event sent via IPC: ${text.slice(0, 50)}`);
     }
   }

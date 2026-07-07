@@ -16,6 +16,7 @@ let agentOverride: string | null = null;
 let sessionsPath: string = "";
 let sessions: Record<string, { sessionId: string; channel: string; lastUsed: number; directory?: string }> = {};
 let defaultDirectory: string = "";
+let allowedUsers: Set<string> | null = null;
 
 type PendingPermission = {
   permissionId: string;
@@ -541,6 +542,10 @@ function startWorker(env: Record<string, string>) {
 
   worker.on("message", (msg: any) => {
     if (msg?.type === "slack_event") {
+      if (allowedUsers && !allowedUsers.has(msg.user)) {
+        log(`blocked user: ${msg.user}`);
+        return;
+      }
       handleMessage(msg.channel, msg.text, msg.threadTs, msg.messageTs);
     }
   });
@@ -604,6 +609,12 @@ const pluginModule: PluginModule = {
     sessionsPath = join(input.directory, "slack-sessions.json");
     loadSessions();
     log(`sessions loaded: ${Object.keys(sessions).length} entries from ${sessionsPath}`);
+
+    const allowedUsersStr = (options?.ALLOWED_USERS as string) || process.env.SLACK_ALLOWED_USERS || "";
+    if (allowedUsersStr) {
+      allowedUsers = new Set(allowedUsersStr.split(",").map(u => u.trim()).filter(Boolean));
+      log(`allowed users: ${[...allowedUsers].join(", ")}`);
+    }
 
     const workerEnv: Record<string, string> = {
       SLACK_BOT_TOKEN: botToken,
