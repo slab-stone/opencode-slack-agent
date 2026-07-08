@@ -132,3 +132,16 @@ socketClient.on("disconnected", () => log("Socket Mode disconnected"));
 await init();
 await socketClient.start();
 log("worker running");
+
+const STALE_TIMEOUT = 120000;
+let lastEventTime = Date.now();
+
+socketClient.on("slack_event", () => { lastEventTime = Date.now(); });
+
+setInterval(() => {
+  const elapsed = Date.now() - lastEventTime;
+  if (elapsed > STALE_TIMEOUT) {
+    log(`no events for ${Math.round(elapsed / 1000)}s, exiting for restart`);
+    process.exit(1);
+  }
+}, 30000);
