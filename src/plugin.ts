@@ -313,7 +313,6 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
           const part = evt.properties?.part;
           if (!part || part.sessionID !== sessionId) continue;
           lastStreamActivityAt = Date.now();
-          lastDelayNotifiedAt = 0;
 
           const partKey = `${part.type}:${part.id}`;
 
@@ -371,7 +370,6 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
 
         if (evt.type === "session.idle" && evt.properties?.sessionID === sessionId) {
           lastStreamActivityAt = Date.now();
-          lastDelayNotifiedAt = 0;
           log(`session ${sessionId} idle via SSE`);
           streamDone = true;
           break;
@@ -379,7 +377,6 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
 
         if (evt.type === "todo.updated" && evt.properties?.sessionID === sessionId) {
           lastStreamActivityAt = Date.now();
-          lastDelayNotifiedAt = 0;
           const todos = evt.properties.todos || [];
           if (todos.length > 0) {
             let msg = "📋 *Plan*\n";

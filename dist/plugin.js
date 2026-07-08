@@ -12701,7 +12701,6 @@ async function handleMessage(channel, text, ts, messageTs, isAllowed = true) {
           const part = evt.properties?.part;
           if (!part || part.sessionID !== sessionId) continue;
           lastStreamActivityAt = Date.now();
-          lastDelayNotifiedAt = 0;
           const partKey = `${part.type}:${part.id}`;
           if (part.type === "tool" && part.tool === "question" && part.state?.status === "running" && !questionPosted) {
             questionPosted = true;
@@ -12754,14 +12753,12 @@ ${q.question}
         }
         if (evt.type === "session.idle" && evt.properties?.sessionID === sessionId) {
           lastStreamActivityAt = Date.now();
-          lastDelayNotifiedAt = 0;
           log(`session ${sessionId} idle via SSE`);
           streamDone = true;
           break;
         }
         if (evt.type === "todo.updated" && evt.properties?.sessionID === sessionId) {
           lastStreamActivityAt = Date.now();
-          lastDelayNotifiedAt = 0;
           const todos = evt.properties.todos || [];
           if (todos.length > 0) {
             let msg = "\u{1F4CB} *Plan*\n";
