@@ -16,7 +16,7 @@ let pluginClient: PluginInput["client"] | null = null;
 let modelOverride: { providerID: string; modelID: string } | null = null;
 let agentOverride: string | null = null;
 let sessionsPath: string = "";
-let sessions: Record<string, { sessionId: string; channel: string; lastUsed: number; directory?: string }> = {};
+let sessions: Record<string, { sessionId: string; channel: string; lastUsed: number; directory?: string; lastSyncedMessageId?: string }> = {};
 let defaultDirectory: string = "";
 let allowedUsers: Set<string> | null = null;
 let allowlistReady = true;
@@ -419,6 +419,11 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
             .join("\n");
           if (textParts) sendLongText(channel, textParts, threadTs);
         }
+        const lastMsg = messages[messages.length - 1];
+        if (lastMsg?.id && sessions[threadTs]) {
+          sessions[threadTs].lastSyncedMessageId = lastMsg.id;
+          saveSessions();
+        }
       }
     } catch (fetchErr: any) {
       log(`final fetch error: ${fetchErr.message}`);
@@ -561,6 +566,71 @@ async function handleCommand(channel: string, text: string, ts: string): Promise
     return true;
   }
 
+  if (cmd === "!sync") {
+    const session = sessions[ts];
+    if (!session?.sessionId) {
+      slackSend(channel, "❌ 이 스레드에 연결된 세션이 없습니다.", ts);
+      return true;
+    }
+    try {
+      const { data: messages } = await pluginClient.session.messages({
+        path: { id: session.sessionId },
+      });
+      if (!Array.isArray(messages) || messages.length === 0) {
+        slackSend(channel, "ℹ️ 세션에 메시지가 없습니다.", ts);
+        return true;
+      }
+
+      const cursor = session.lastSyncedMessageId;
+      let startIndex = 0;
+      if (cursor) {
+        const cursorIdx = messages.findIndex((m: any) => m.id === cursor);
+        if (cursorIdx >= 0) startIndex = cursorIdx + 1;
+      }
+
+      const unsyncedMessages = messages.slice(startIndex).filter(
+        (m: any) => m.info?.role === "assistant" || m.info?.role === "user"
+      ).sort((a: any, b: any) => (a.info?.time?.created || 0) - (b.info?.time?.created || 0));
+
+      if (unsyncedMessages.length === 0) {
+        slackSend(channel, "✅ 동기화할 새 메시지가 없습니다.", ts);
+        return true;
+      }
+
+      for (const msg of unsyncedMessages) {
+        const role = msg.info?.role;
+        const textParts = (msg.parts as any[])
+          .filter((p: any) => p.type === "text" && p.text)
+          .map((p: any) => p.text)
+          .join("\n");
+        if (!textParts) continue;
+
+        if (role === "user") {
+          const quoted = textParts.split("\n").map((l: string) => `> ${l}`).join("\n");
+          slackSend(channel, `👤 *User:*\n${quoted}`, ts);
+        } else {
+          sendLongText(channel, `🤖 *Assistant:*\n${textParts}`, ts);
+        }
+      }
+
+      const lastMsg = messages[messages.length - 1];
+      if (lastMsg?.id) {
+        sessions[ts].lastSyncedMessageId = lastMsg.id;
+        saveSessions();
+      }
+
+      const syncedCount = unsyncedMessages.filter((m: any) => {
+        const parts = (m.parts as any[]).filter((p: any) => p.type === "text" && p.text);
+        return parts.length > 0;
+      }).length;
+      slackSend(channel, `✅ ${syncedCount}개 메시지 동기화 완료.`, ts);
+    } catch (err: any) {
+      log(`!sync error: ${err.message}`);
+      slackSend(channel, `❌ 동기화 오류: ${err.message}`, ts);
+    }
+    return true;
+  }
+
   if (cmd === "!help") {
     const help = [
       "*사용 가능한 명령:*",
@@ -573,6 +643,7 @@ async function handleCommand(channel: string, text: string, ts: string): Promise
       "• `!dir` — 현재 워크스페이스 확인",
       "• `!dir /path/to/project` — 워크스페이스 변경",
       "• `!attach ses_xxx` — 기존 세션 연결 (URL 붙여넣기 가능)",
+      "• `!sync` — 클라이언트 메시지를 슬랙으로 동기화",
       "• `!reset` — 현재 스레드 세션 리셋",
       "• `!help` — 이 도움말",
     ];
