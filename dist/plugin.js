@@ -12654,7 +12654,7 @@ async function handleMessage(channel, text, ts, messageTs, isAllowed = true) {
         clearInterval(idleCheck);
         return;
       }
-      if (Date.now() - idleCheckStart < 3e3) return;
+      if (Date.now() - idleCheckStart < 2e3) return;
       try {
         const { data: messages } = await pluginClient.session.messages({
           path: { id: sessionId }
@@ -12671,7 +12671,7 @@ async function handleMessage(channel, text, ts, messageTs, isAllowed = true) {
         }
       } catch {
       }
-    }, 5e3);
+    }, 2e3);
     try {
       for await (const event of stream) {
         if (streamDone) break;

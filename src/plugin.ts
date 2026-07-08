@@ -266,7 +266,7 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
     const idleCheckStart = Date.now();
     const idleCheck = setInterval(async () => {
       if (streamDone) { clearInterval(idleCheck); return; }
-      if (Date.now() - idleCheckStart < 3000) return;
+      if (Date.now() - idleCheckStart < 2000) return;
       try {
         const { data: messages } = await pluginClient!.session.messages({
           path: { id: sessionId },
@@ -282,7 +282,7 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
           }
         }
       } catch {}
-    }, 5000);
+    }, 2000);
 
     try {
       for await (const event of stream) {
