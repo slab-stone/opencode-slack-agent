@@ -12433,6 +12433,8 @@ import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 var LOG_FILE = "/tmp/slack-agent-plugin.log";
 var SLACK_MSG_LIMIT = 3900;
+var RESPONSE_STALL_MS = 45e3;
+var RESPONSE_STALL_NOTIFY_INTERVAL_MS = 6e4;
 var initialized = false;
 var worker = null;
 var pluginClient = null;
@@ -12442,6 +12444,7 @@ var sessionsPath = "";
 var sessions = {};
 var defaultDirectory = "";
 var allowedUsers = null;
+var allowlistReady = true;
 var pendingPermissions = /* @__PURE__ */ new Map();
 var pendingQuestions = /* @__PURE__ */ new Map();
 function log(m) {
@@ -12643,6 +12646,8 @@ async function handleMessage(channel, text, ts, messageTs, isAllowed = true) {
       return;
     }
     let streamDone = false;
+    let lastStreamActivityAt = Date.now();
+    let lastDelayNotifiedAt = 0;
     const timeout = setTimeout(() => {
       log("SSE timeout (6min)");
       streamDone = true;
@@ -12672,6 +12677,21 @@ async function handleMessage(channel, text, ts, messageTs, isAllowed = true) {
       } catch {
       }
     }, 2e3);
+    const delayCheck = setInterval(() => {
+      if (streamDone) {
+        clearInterval(delayCheck);
+        return;
+      }
+      const now = Date.now();
+      const stalledMs = now - lastStreamActivityAt;
+      const shouldNotify = stalledMs >= RESPONSE_STALL_MS && (lastDelayNotifiedAt === 0 || now - lastDelayNotifiedAt >= RESPONSE_STALL_NOTIFY_INTERVAL_MS);
+      if (shouldNotify) {
+        const stalledSec = Math.floor(stalledMs / 1e3);
+        slackSend(channel, `\u23F3 \uC751\uB2F5\uC774 \uC9C0\uC5F0\uB418\uACE0 \uC788\uC5B4\uC694 (${stalledSec}\uCD08 \uACBD\uACFC). \uACC4\uC18D \uCC98\uB9AC \uC911\uC785\uB2C8\uB2E4.`, threadTs);
+        lastDelayNotifiedAt = now;
+        log(`response stall detected: session=${sessionId} stalled=${stalledSec}s`);
+      }
+    }, 5e3);
     try {
       for await (const event of stream) {
         if (streamDone) break;
@@ -12680,6 +12700,8 @@ async function handleMessage(channel, text, ts, messageTs, isAllowed = true) {
         if (evt.type === "message.part.updated") {
           const part = evt.properties?.part;
           if (!part || part.sessionID !== sessionId) continue;
+          lastStreamActivityAt = Date.now();
+          lastDelayNotifiedAt = 0;
           const partKey = `${part.type}:${part.id}`;
           if (part.type === "tool" && part.tool === "question" && part.state?.status === "running" && !questionPosted) {
             questionPosted = true;
@@ -12731,11 +12753,15 @@ ${q.question}
           }
         }
         if (evt.type === "session.idle" && evt.properties?.sessionID === sessionId) {
+          lastStreamActivityAt = Date.now();
+          lastDelayNotifiedAt = 0;
           log(`session ${sessionId} idle via SSE`);
           streamDone = true;
           break;
         }
         if (evt.type === "todo.updated" && evt.properties?.sessionID === sessionId) {
+          lastStreamActivityAt = Date.now();
+          lastDelayNotifiedAt = 0;
           const todos = evt.properties.todos || [];
           if (todos.length > 0) {
             let msg = "\u{1F4CB} *Plan*\n";
@@ -12760,6 +12786,7 @@ ${q.question}
       streamDone = true;
       clearTimeout(timeout);
       clearInterval(idleCheck);
+      clearInterval(delayCheck);
     }
     try {
       const { data: messages } = await pluginClient.session.messages({
@@ -12920,7 +12947,7 @@ function startWorker(env) {
   });
   worker.on("message", (msg) => {
     if (msg?.type === "slack_event") {
-      const isAllowed = !allowedUsers || allowedUsers.has(msg.user);
+      const isAllowed = !allowedUsers || !allowlistReady || allowedUsers.has(msg.user);
       const isThreadReply = msg.threadTs !== msg.messageTs;
       if (!isAllowed && !isThreadReply) {
         log(`blocked user: ${msg.user} (new thread)`);
@@ -12934,6 +12961,7 @@ function startWorker(env) {
         }
         log(`resolved email users: ${msg.users.join(", ")}`);
       }
+      allowlistReady = true;
     }
   });
   worker.on("exit", (code) => {
@@ -12989,14 +13017,12 @@ var pluginModule = {
     loadSessions();
     log(`sessions loaded: ${Object.keys(sessions).length} entries from ${sessionsPath}`);
     const allowedUsersStr = options?.ALLOWED_USERS || process.env.SLACK_ALLOWED_USERS || "";
+    let emailsToResolve = [];
     if (allowedUsersStr) {
       const entries = allowedUsersStr.split(",").map((u) => u.trim()).filter(Boolean);
       allowedUsers = new Set(entries.filter((e) => e.startsWith("U")));
-      const emails = entries.filter((e) => e.includes("@"));
-      if (emails.length > 0) {
-        sendIPC({ type: "resolve_emails", emails });
-      }
-      log(`allowed users: ${[...allowedUsers].join(", ")}${emails.length ? ` + ${emails.length} emails to resolve` : ""}`);
+      emailsToResolve = entries.filter((e) => e.includes("@"));
+      log(`allowed users: ${[...allowedUsers].join(", ")}${emailsToResolve.length ? ` + ${emailsToResolve.length} emails to resolve` : ""}`);
     }
     const workerEnv = {
       SLACK_BOT_TOKEN: botToken,
@@ -13004,7 +13030,13 @@ var pluginModule = {
     };
     const caCerts = options?.NODE_EXTRA_CA_CERTS || process.env.NODE_EXTRA_CA_CERTS || "";
     if (caCerts) workerEnv.NODE_EXTRA_CA_CERTS = caCerts;
+    if (emailsToResolve.length > 0) {
+      allowlistReady = false;
+    }
     startWorker(workerEnv);
+    if (emailsToResolve.length > 0) {
+      sendIPC({ type: "resolve_emails", emails: emailsToResolve });
+    }
     initialized = true;
     log("plugin initialized (hybrid sidecar + persistent sessions)");
     return {
