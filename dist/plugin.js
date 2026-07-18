@@ -12566,6 +12566,9 @@ setInterval(() => {
 function slackSend(channel, text, threadTs) {
   sendIPC({ type: "slack_send", channel, text: markdownToSlackMrkdwn(text), threadTs });
 }
+function clearProcessingIndicators(channel, threadTs) {
+  sendIPC({ type: "slack_thinking_clear", channel, threadTs });
+}
 function findPendingPermissionForThread(threadTs) {
   for (const [key, perm] of pendingPermissions) {
     if (perm.threadTs === threadTs) {
@@ -12631,30 +12634,47 @@ async function handleQuestionReply(pending, text, channel, threadTs) {
   }
 }
 async function handleMessage(channel, text, ts, messageTs, isAllowed = true) {
-  if (!pluginClient) return;
+  if (!pluginClient) {
+    sendIPC({ type: "slack_reaction_remove", channel, name: "eyes", timestamp: messageTs || ts });
+    clearProcessingIndicators(channel, ts);
+    return;
+  }
   const actualTs = messageTs || ts;
   log(`handleMessage: ${text.slice(0, 50)}`);
   if (text.startsWith("!")) {
-    if (!isAllowed) return;
+    if (!isAllowed) {
+      clearProcessingIndicators(channel, ts);
+      return;
+    }
     const handled = await handleCommand(channel, text, ts);
-    if (handled) return;
+    if (handled) {
+      sendIPC({ type: "slack_reaction_remove", channel, name: "eyes", timestamp: actualTs });
+      clearProcessingIndicators(channel, ts);
+      return;
+    }
   }
   const pending = findPendingPermissionForThread(ts);
   if (pending) {
-    if (!isAllowed) return;
+    if (!isAllowed) {
+      clearProcessingIndicators(channel, ts);
+      return;
+    }
     await handlePermissionReply(pending, text, channel, ts);
+    sendIPC({ type: "slack_reaction_remove", channel, name: "eyes", timestamp: actualTs });
+    clearProcessingIndicators(channel, ts);
     return;
   }
   const pendingQ = findPendingQuestionForThread(ts);
   if (pendingQ) {
     await handleQuestionReply(pendingQ, text, channel, ts);
+    sendIPC({ type: "slack_reaction_remove", channel, name: "eyes", timestamp: actualTs });
     return;
   }
   try {
     const threadTs = ts;
     let sessionId = getSessionForThread(threadTs);
     let syncCursor = sessions[threadTs]?.lastSyncedMessageId;
-    sendIPC({ type: "slack_reaction", channel, name: "peperun", timestamp: actualTs });
+    sendIPC({ type: "slack_reaction", channel, name: "eyes", timestamp: actualTs });
     if (!sessionId) {
       const directory = sessions[threadTs]?.directory || defaultDirectory;
       const { data: session } = await pluginClient.session.create({
@@ -12708,7 +12728,8 @@ async function handleMessage(channel, text, ts, messageTs, isAllowed = true) {
     if (!stream) {
       log("SSE stream not available, falling back to polling");
       slackSend(channel, "\u274C \uC774\uBCA4\uD2B8 \uC2A4\uD2B8\uB9BC \uC5F0\uACB0 \uC2E4\uD328", threadTs);
-      sendIPC({ type: "slack_reaction_remove", channel, name: "peperun", timestamp: actualTs });
+      sendIPC({ type: "slack_reaction_remove", channel, name: "eyes", timestamp: actualTs });
+      clearProcessingIndicators(channel, threadTs);
       return;
     }
     let streamDone = false;
@@ -12789,7 +12810,7 @@ ${q.question}
             slackSend(channel, msg, threadTs);
             pendingQuestions.set(threadTs, { sessionId, threadTs, channel, createdAt: Date.now() });
             log(`question forwarded to slack for thread ${threadTs}`);
-            sendIPC({ type: "slack_reaction_remove", channel, name: "peperun", timestamp: actualTs });
+            sendIPC({ type: "slack_reaction_remove", channel, name: "eyes", timestamp: actualTs });
             clearTimeout(timeout);
             return;
           }
@@ -12901,10 +12922,13 @@ ${q.question}
         }
       }
     }
-    sendIPC({ type: "slack_reaction_remove", channel, name: "peperun", timestamp: actualTs });
+    sendIPC({ type: "slack_reaction_remove", channel, name: "eyes", timestamp: actualTs });
+    clearProcessingIndicators(channel, threadTs);
     log(`session ${sessionId} completed`);
   } catch (e) {
     log(`error: ${e.message}`);
+    sendIPC({ type: "slack_reaction_remove", channel, name: "eyes", timestamp: actualTs });
+    clearProcessingIndicators(channel, ts);
     slackSend(channel, `\u274C \uC624\uB958: ${e.message}`, ts);
   }
 }
@@ -13460,6 +13484,8 @@ function attachWorkerHandlers(w) {
       const isThreadReply = msg.threadTs !== msg.messageTs;
       if (!isAllowed && !isThreadReply) {
         log(`inbound blocked_user ${inboundMeta(msg)} reason=new_thread_not_allowlisted`);
+        sendIPC({ type: "slack_reaction_remove", channel: msg.channel, name: "eyes", timestamp: msg.messageTs });
+        clearProcessingIndicators(msg.channel, msg.threadTs);
         return;
       }
       log(`inbound dispatch_handleMessage ${inboundMeta(msg)}`);
