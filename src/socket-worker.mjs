@@ -12,6 +12,21 @@ const botToken = process.env.SLACK_BOT_TOKEN;
 const appToken = process.env.SLACK_APP_TOKEN;
 const caCerts = process.env.NODE_EXTRA_CA_CERTS;
 
+// Slack "thinking" indicator (assistant.threads.setStatus).
+// Auto-clears when the bot replies in the thread, but Slack also enforces a
+// 2-minute timeout — we refresh on a timer to keep it alive for long sessions.
+// Docs: https://docs.slack.dev/reference/methods/assistant.threads.setStatus
+const INSTANT_REACTION_NAME = "eyes";
+const THINKING_STATUS_REFRESH_MS = 90_000; // refresh before the 2-min Slack timeout
+const THINKING_STATUS_TEXT = "is thinking...";
+const THINKING_LOADING_MESSAGES = [
+  "Reading the message...",
+  "Thinking...",
+  "Working on it...",
+  "Almost there...",
+];
+const activeThinking = new Map(); // key: `${channelId}:${threadTs}` -> NodeJS Timeout
+
 if (!botToken || !appToken) {
   process.exit(1);
 }
@@ -101,6 +116,51 @@ async function addReaction(channel, name, timestamp) {
   try { await slack.reactions.add({ channel, name, timestamp }); } catch {}
 }
 
+function thinkingKey(channelId, threadTs) {
+  return `${channelId}:${threadTs}`;
+}
+
+// Calls assistant.threads.setStatus via the low-level apiCall so this works
+// on any @slack/web-api version (the typed binding `slack.assistant.threads.setStatus`
+// only exists on >=7.10.0). Required scope: chat:write (already granted).
+async function setAssistantStatus(channelId, threadTs, status, loadingMessages) {
+  try {
+    await slack.apiCall("assistant.threads.setStatus", {
+      channel_id: channelId,
+      thread_ts: threadTs,
+      status,
+      ...(loadingMessages ? { loading_messages: loadingMessages } : {}),
+    });
+    return true;
+  } catch (e) {
+    log(`assistant.threads.setStatus (${status ? "set" : "clear"}) failed: ${e?.message || e}`);
+    return false;
+  }
+}
+
+// Show "is thinking..." + start a refresh interval. Idempotent per thread.
+function startThinking(channelId, threadTs) {
+  const key = thinkingKey(channelId, threadTs);
+  if (activeThinking.has(key)) return;
+  setAssistantStatus(channelId, threadTs, THINKING_STATUS_TEXT, THINKING_LOADING_MESSAGES);
+  const interval = setInterval(() => {
+    setAssistantStatus(channelId, threadTs, THINKING_STATUS_TEXT, THINKING_LOADING_MESSAGES);
+  }, THINKING_STATUS_REFRESH_MS);
+  activeThinking.set(key, interval);
+}
+
+// Stop the refresh interval and explicitly clear the indicator.
+// Always safe to call — no-op if nothing is active.
+async function stopThinking(channelId, threadTs) {
+  const key = thinkingKey(channelId, threadTs);
+  const interval = activeThinking.get(key);
+  if (interval) {
+    clearInterval(interval);
+    activeThinking.delete(key);
+  }
+  await setAssistantStatus(channelId, threadTs, "");
+}
+
 process.on("message", async (msg) => {
   if (msg?.type === "slack_send") {
     await sendToSlack(msg.channel, msg.text, msg.threadTs);
@@ -110,6 +170,8 @@ process.on("message", async (msg) => {
     await addReaction(msg.channel, msg.name, msg.timestamp);
   } else if (msg?.type === "slack_reaction_remove") {
     try { await slack.reactions.remove({ channel: msg.channel, name: msg.name, timestamp: msg.timestamp }); } catch {}
+  } else if (msg?.type === "slack_thinking_clear") {
+    await stopThinking(msg.channel, msg.threadTs);
   } else if (msg?.type === "slack_upload") {
     try {
       await slack.filesUploadV2({
@@ -177,6 +239,15 @@ socketClient.on("slack_event", async ({ body, ack }) => {
       : ev.text;
 
     if (text && process.send) {
+      // INSTANT visual feedback: add 👀 reaction and set the "is thinking..."
+      // assistant status BEFORE handing off to the plugin, so the user sees
+      // acknowledgment the moment the message hits Slack (not after the plugin
+      // wakes up, creates a session, etc.).
+      const inboundTs = ev.ts;
+      const inboundThreadTs = ev.thread_ts || ev.ts;
+      addReaction(ev.channel, INSTANT_REACTION_NAME, inboundTs);
+      startThinking(ev.channel, inboundThreadTs);
+
       process.send({
         type: "slack_event",
         channel: ev.channel,
