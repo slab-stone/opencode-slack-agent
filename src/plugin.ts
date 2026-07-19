@@ -284,6 +284,12 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
   // the canonical text fetched from the session, so the worker can do a
   // clean markdown render + overflow-to-file for the final reply.
   const streamedTextParts = new Set<string>();
+  // Last cumulative text snapshot we forwarded per streamId. opencode's SSE
+  // stream emits only heartbeats + tool/todo state — NOT per-token text
+  // deltas — so streaming is driven by the idleCheck poll: each tick fetches
+  // messages, and any text part whose `text` grew since the last tick is
+  // forwarded to the worker as a `fullText` delta.
+  const lastStreamedText = new Map<string, string>();
 
   try {
     const threadTs = ts;
@@ -373,15 +379,34 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
         const { data: messages } = await pluginClient!.session.messages({
           path: { id: sessionId },
         });
-        if (Array.isArray(messages)) {
-          const lastAssistant = [...messages].reverse().find(
-            (m: any) => m.info?.role === "assistant"
-          );
-          if (lastAssistant?.info?.time?.completed) {
-            log(`session ${sessionId} idle via poll fallback`);
-            streamDone = true;
-            stream.return(undefined);
+        if (!Array.isArray(messages)) return;
+
+        for (const m of messages) {
+          if (m?.info?.role !== "assistant" || !Array.isArray(m.parts) || !m.id) continue;
+          for (const part of m.parts) {
+            if (part?.type !== "text" || typeof part.text !== "string" || !part.text || !part.id) continue;
+            const streamId = `${m.id}:${part.id}`;
+            const prev = lastStreamedText.get(streamId) ?? "";
+            if (part.text === prev) continue;
+            lastStreamedText.set(streamId, part.text);
+            streamedTextParts.add(streamId);
+            sendIPC({
+              type: "slack_stream_delta",
+              channel, threadTs,
+              messageID: m.id,
+              partID: part.id,
+              fullText: part.text,
+            });
           }
+        }
+
+        const lastAssistant = [...messages].reverse().find(
+          (m: any) => m.info?.role === "assistant"
+        );
+        if (lastAssistant?.info?.time?.completed) {
+          log(`session ${sessionId} idle via poll fallback`);
+          streamDone = true;
+          stream.return(undefined);
         }
       } catch {}
     }, 2000);

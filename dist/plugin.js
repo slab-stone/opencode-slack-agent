@@ -12669,6 +12669,7 @@ async function handleMessage(channel, text, ts, messageTs, isAllowed = true) {
     return;
   }
   const streamedTextParts = /* @__PURE__ */ new Set();
+  const lastStreamedText = /* @__PURE__ */ new Map();
   try {
     const threadTs = ts;
     let sessionId = getSessionForThread(threadTs);
@@ -12749,15 +12750,33 @@ async function handleMessage(channel, text, ts, messageTs, isAllowed = true) {
         const { data: messages } = await pluginClient.session.messages({
           path: { id: sessionId }
         });
-        if (Array.isArray(messages)) {
-          const lastAssistant = [...messages].reverse().find(
-            (m) => m.info?.role === "assistant"
-          );
-          if (lastAssistant?.info?.time?.completed) {
-            log(`session ${sessionId} idle via poll fallback`);
-            streamDone = true;
-            stream.return(void 0);
+        if (!Array.isArray(messages)) return;
+        for (const m of messages) {
+          if (m?.info?.role !== "assistant" || !Array.isArray(m.parts) || !m.id) continue;
+          for (const part of m.parts) {
+            if (part?.type !== "text" || typeof part.text !== "string" || !part.text || !part.id) continue;
+            const streamId = `${m.id}:${part.id}`;
+            const prev = lastStreamedText.get(streamId) ?? "";
+            if (part.text === prev) continue;
+            lastStreamedText.set(streamId, part.text);
+            streamedTextParts.add(streamId);
+            sendIPC({
+              type: "slack_stream_delta",
+              channel,
+              threadTs,
+              messageID: m.id,
+              partID: part.id,
+              fullText: part.text
+            });
           }
+        }
+        const lastAssistant = [...messages].reverse().find(
+          (m) => m.info?.role === "assistant"
+        );
+        if (lastAssistant?.info?.time?.completed) {
+          log(`session ${sessionId} idle via poll fallback`);
+          streamDone = true;
+          stream.return(void 0);
         }
       } catch {
       }
