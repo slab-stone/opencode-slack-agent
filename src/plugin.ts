@@ -8,8 +8,6 @@ import { homedir } from "os";
 
 const LOG_FILE = "/tmp/slack-agent-plugin.log";
 const SLACK_MSG_LIMIT = 3900;
-const RESPONSE_STALL_MS = 45_000;
-const RESPONSE_STALL_NOTIFY_INTERVAL_MS = 60_000;
 const DEFAULT_ATTACH_TIMEOUT_SEC = 600;
 const BG_OUTPUT_REQUEST_TIMEOUT_MS = 15_000;
 const BG_OUTPUT_CANDIDATE_PATHS = ["/background/output", "/background_output", "/api/background/output"] as const;
@@ -280,6 +278,13 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
     return;
   }
 
+  // Hoisted out of the try block so the outer catch can abort open streams.
+  // Tracks `${messageID}:${partID}` of assistant text parts forwarded to the
+  // worker as stream deltas. At session.idle each entry is finalized with
+  // the canonical text fetched from the session, so the worker can do a
+  // clean markdown render + overflow-to-file for the final reply.
+  const streamedTextParts = new Set<string>();
+
   try {
     const threadTs = ts;
     let sessionId = getSessionForThread(threadTs);
@@ -353,7 +358,6 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
 
     let streamDone = false;
     let lastStreamActivityAt = Date.now();
-    let lastDelayNotifiedAt = 0;
 
     const timeout = setTimeout(() => {
       log("SSE timeout (6min)");
@@ -381,20 +385,6 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
         }
       } catch {}
     }, 2000);
-
-    const delayCheck = setInterval(() => {
-      if (streamDone) { clearInterval(delayCheck); return; }
-      const now = Date.now();
-      const stalledMs = now - lastStreamActivityAt;
-      const shouldNotify = stalledMs >= RESPONSE_STALL_MS
-        && (lastDelayNotifiedAt === 0 || now - lastDelayNotifiedAt >= RESPONSE_STALL_NOTIFY_INTERVAL_MS);
-      if (shouldNotify) {
-        const stalledSec = Math.floor(stalledMs / 1000);
-        slackSend(channel, `⏳ 응답이 지연되고 있어요 (${stalledSec}초 경과). 계속 처리 중입니다.`, threadTs);
-        lastDelayNotifiedAt = now;
-        log(`response stall detected: session=${sessionId} stalled=${stalledSec}s`);
-      }
-    }, 5000);
 
     try {
       for await (const event of stream) {
@@ -470,6 +460,30 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
             slackSend(channel, `💭 ${snippet}`, threadTs);
             log(`stream: 💭`);
           }
+
+          if (part.type === "text" && part.id && part.messageID) {
+            const streamId = `${part.messageID}:${part.id}`;
+            streamedTextParts.add(streamId);
+            const deltaText = (evt.properties as any)?.delta;
+            if (typeof deltaText === "string" && deltaText.length > 0) {
+              sendIPC({
+                type: "slack_stream_delta",
+                channel, threadTs,
+                messageID: part.messageID,
+                partID: part.id,
+                delta: deltaText,
+              });
+            } else if (typeof part.text === "string" && part.text.length > 0) {
+              // No delta field — fall back to cumulative text snapshot.
+              sendIPC({
+                type: "slack_stream_delta",
+                channel, threadTs,
+                messageID: part.messageID,
+                partID: part.id,
+                fullText: part.text,
+              });
+            }
+          }
         }
 
         if (evt.type === "session.idle" && evt.properties?.sessionID === sessionId) {
@@ -505,17 +519,18 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
       streamDone = true;
       clearTimeout(timeout);
       clearInterval(idleCheck);
-      clearInterval(delayCheck);
     }
 
     try {
-      syncCursor = await syncAssistantMessagesSinceCursor(sessionId, channel, threadTs, syncCursor);
+      syncCursor = await syncAssistantMessagesSinceCursor(sessionId, channel, threadTs, syncCursor, streamedTextParts);
       if (syncCursor && sessions[threadTs]) {
         sessions[threadTs].lastSyncedMessageId = syncCursor;
         saveSessions();
       }
     } catch (fetchErr: any) {
       log(`final sync error: ${fetchErr.message}`);
+      // Best-effort cleanup of any open streams on sync failure.
+      abortOpenStreams(channel, threadTs, streamedTextParts);
     }
 
     if (backgroundTaskIDs.size > 0) {
@@ -555,6 +570,7 @@ async function handleMessage(channel: string, text: string, ts: string, messageT
     log(`session ${sessionId} completed`);
   } catch (e: any) {
     log(`error: ${e.message}`);
+    abortOpenStreams(channel, ts, streamedTextParts);
     sendIPC({ type: "slack_reaction_remove", channel, name: "eyes", timestamp: actualTs });
     clearProcessingIndicators(channel, ts);
     slackSend(channel, `❌ 오류: ${e.message}`, ts);
@@ -875,13 +891,17 @@ async function syncAssistantMessagesSinceCursor(
   channel: string,
   threadTs: string,
   cursorId?: string,
+  streamedTextParts?: Set<string>,
 ): Promise<string | undefined> {
   if (!pluginClient) return cursorId;
 
   const { data: messages } = await pluginClient.session.messages({
     path: { id: sessionId },
   });
-  if (!Array.isArray(messages) || messages.length === 0) return cursorId;
+  if (!Array.isArray(messages) || messages.length === 0) {
+    abortOpenStreams(channel, threadTs, streamedTextParts);
+    return cursorId;
+  }
 
   let startIndex = 0;
   if (cursorId) {
@@ -899,15 +919,41 @@ async function syncAssistantMessagesSinceCursor(
       log(`skip assistant message with non-array parts: ${msg.id || "unknown"}`);
       continue;
     }
-    const textParts = (msg.parts as any[])
-      .filter((p: any) => p.type === "text" && p.text)
-      .map((p: any) => p.text)
-      .join("\n");
-    if (textParts) sendLongText(channel, textParts, threadTs);
+    let unstreamedText = "";
+    for (const part of msg.parts as any[]) {
+      if (part?.type !== "text" || !part.text) continue;
+      const streamId = `${msg.id}:${part.id}`;
+      if (streamedTextParts?.has(streamId)) {
+        sendIPC({
+          type: "slack_stream_finalize",
+          channel, threadTs,
+          messageID: msg.id,
+          partID: part.id,
+          fullText: part.text,
+        });
+        streamedTextParts.delete(streamId);
+      } else {
+        unstreamedText += (unstreamedText ? "\n" : "") + part.text;
+      }
+    }
+    if (unstreamedText) sendLongText(channel, unstreamedText, threadTs);
   }
+
+  abortOpenStreams(channel, threadTs, streamedTextParts);
 
   const lastMsg = messages[messages.length - 1];
   return lastMsg?.id || cursorId;
+}
+
+function abortOpenStreams(channel: string, threadTs: string, streamedTextParts?: Set<string>) {
+  if (!streamedTextParts || streamedTextParts.size === 0) return;
+  for (const streamId of streamedTextParts) {
+    const sepIdx = streamId.indexOf(":");
+    const messageID = sepIdx >= 0 ? streamId.slice(0, sepIdx) : streamId;
+    const partID = sepIdx >= 0 ? streamId.slice(sepIdx + 1) : "";
+    sendIPC({ type: "slack_stream_abort", channel, threadTs, messageID, partID });
+  }
+  streamedTextParts.clear();
 }
 
 async function handleAttachBackgroundTask(

@@ -19,11 +19,12 @@ const caCerts = process.env.NODE_EXTRA_CA_CERTS;
 const INSTANT_REACTION_NAME = "eyes";
 const THINKING_STATUS_REFRESH_MS = 90_000; // refresh before the 2-min Slack timeout
 const THINKING_STATUS_TEXT = "is thinking...";
+// Cycle only the trailing dots so the indicator pulses subtly instead of
+// rotating through different status phrases (which feels noisy).
 const THINKING_LOADING_MESSAGES = [
-  "Reading the message...",
+  "Thinking.",
+  "Thinking..",
   "Thinking...",
-  "Working on it...",
-  "Almost there...",
 ];
 const activeThinking = new Map(); // key: `${channelId}:${threadTs}` -> NodeJS Timeout
 
@@ -82,10 +83,40 @@ async function init() {
   log(`ready: bot=${botUserId}`);
 }
 
+// Markdown -> Slack mrkdwn conversion (duplicated from plugin.ts because the
+// worker needs it for final stream render and plugin/worker can't share code).
+function markdownToSlackMrkdwn(text) {
+  let result = text;
+  const codeBlocks = [];
+  result = result.replace(/```[\w]*\n([\s\S]*?)```/g, (_, code) => {
+    codeBlocks.push(code);
+    return `\x00CODEBLOCK${codeBlocks.length - 1}\x00`;
+  });
+  const inlineCodes = [];
+  result = result.replace(/`([^`]+)`/g, (_, code) => {
+    inlineCodes.push(code);
+    return `\x00INLINE${inlineCodes.length - 1}\x00`;
+  });
+  result = result.replace(/\[([^\]]+)\]\(([^)]+)\)/g, "<$2|$1>");
+  result = result.replace(/\*\*(.+?)\*\*/g, "*$1*");
+  result = result.replace(/^#{1,6}\s+(.+)$/gm, "*$1*");
+  result = result.replace(/\*\*+/g, "*");
+  result = result.replace(/~~(.+?)~~/g, "~$1~");
+  result = result.replace(/^(\s*)[-*]\s+/gm, "$1• ");
+  for (let i = 0; i < inlineCodes.length; i++) {
+    result = result.replace(`\x00INLINE${i}\x00`, `\`${inlineCodes[i]}\``);
+  }
+  for (let i = 0; i < codeBlocks.length; i++) {
+    result = result.replace(`\x00CODEBLOCK${i}\x00`, "```\n" + codeBlocks[i] + "```");
+  }
+  return result;
+}
+
 async function sendToSlack(channel, text, threadTs) {
   try {
     if (text.length <= SLACK_MSG_LIMIT) {
       await slack.chat.postMessage({ channel, text, thread_ts: threadTs, mrkdwn: true });
+      restoreThinkingIfActive(channel, threadTs);
       return;
     }
     const chunks = [];
@@ -109,6 +140,7 @@ async function sendToSlack(channel, text, threadTs) {
         mrkdwn: true,
       });
     }
+    restoreThinkingIfActive(channel, threadTs);
   } catch {}
 }
 
@@ -161,6 +193,201 @@ async function stopThinking(channelId, threadTs) {
   await setAssistantStatus(channelId, threadTs, "");
 }
 
+// Slack auto-clears the assistant.threads.setStatus indicator whenever the
+// bot posts a new message in the thread (chat.postMessage). For multi-step
+// turns (text -> tool -> more text) this makes the bot look dead between
+// steps. Re-assert the status after every postMessage if thinking is active.
+function restoreThinkingIfActive(channelId, threadTs) {
+  if (!channelId || !threadTs) return;
+  const key = thinkingKey(channelId, threadTs);
+  if (!activeThinking.has(key)) return;
+  setAssistantStatus(channelId, threadTs, THINKING_STATUS_TEXT, THINKING_LOADING_MESSAGES);
+}
+
+// --- Streaming response buffer ---
+// ChatGPT-style streaming: post a placeholder on first delta, chat.update
+// with growing text (throttled), then a final clean render on completion.
+//
+// State key: `${channelId}:${threadTs}:${messageID}:${partID}`
+//   - per assistant text part (a single turn can have multiple text parts
+//     across tool calls; each gets its own Slack message).
+const STREAM_FLUSH_INTERVAL_MS = 1200; // throttle chat.update (~1/sec + buffer)
+const STREAM_PLACEHOLDER_TEXT = "_…_";
+const STREAM_OVERFLOW_NOTE = "\n\n_… (more in final reply)_";
+const streamBuffers = new Map();
+
+function streamKey(channelId, threadTs, messageID, partID) {
+  return `${channelId}:${threadTs}:${messageID}:${partID}`;
+}
+
+async function handleStreamDelta({ channel, threadTs, messageID, partID, delta, fullText }) {
+  if (!channel || !threadTs || !messageID || !partID) return;
+  const key = streamKey(channel, threadTs, messageID, partID);
+  let state = streamBuffers.get(key);
+  if (!state) {
+    state = {
+      channel, threadTs, messageID, partID,
+      messageTs: null,
+      text: "",
+      lastFlushAt: 0,
+      flushTimer: null,
+      finalized: false,
+    };
+    streamBuffers.set(key, state);
+  }
+  if (state.finalized) return;
+
+  if (typeof fullText === "string") {
+    state.text = fullText;
+  } else if (typeof delta === "string") {
+    state.text += delta;
+  }
+  if (!state.text) return;
+
+  // Post placeholder on first delta and capture ts for later chat.update.
+  if (!state.messageTs) {
+    try {
+      const result = await slack.chat.postMessage({
+        channel,
+        thread_ts: threadTs,
+        text: STREAM_PLACEHOLDER_TEXT,
+        mrkdwn: true,
+      });
+      state.messageTs = result?.ts || result?.message?.ts || null;
+      state.lastFlushAt = Date.now();
+      // postMessage auto-clears the thinking indicator — restore it so the
+      // user sees activity while the response streams.
+      restoreThinkingIfActive(channel, threadTs);
+    } catch (e) {
+      log(`stream placeholder post error: ${e?.message || e}`);
+    }
+    return;
+  }
+
+  // Throttle subsequent updates to ~1 per STREAM_FLUSH_INTERVAL_MS.
+  const now = Date.now();
+  if (now - state.lastFlushAt >= STREAM_FLUSH_INTERVAL_MS) {
+    await flushStreamUpdate(state);
+  } else if (!state.flushTimer) {
+    state.flushTimer = setTimeout(() => {
+      if (state.flushTimer) clearTimeout(state.flushTimer);
+      state.flushTimer = null;
+      flushStreamUpdate(state);
+    }, STREAM_FLUSH_INTERVAL_MS);
+  }
+}
+
+async function flushStreamUpdate(state) {
+  if (!state.messageTs || !state.text || state.finalized) return;
+  const display = state.text.length > SLACK_MSG_LIMIT
+    ? state.text.slice(0, SLACK_MSG_LIMIT) + STREAM_OVERFLOW_NOTE
+    : state.text;
+  try {
+    await slack.chat.update({
+      channel: state.channel,
+      ts: state.messageTs,
+      text: display,
+      mrkdwn: true,
+    });
+    state.lastFlushAt = Date.now();
+  } catch (e) {
+    log(`stream flush error: ${e?.message || e}`);
+  }
+}
+
+async function finalizeStream({ channel, threadTs, messageID, partID, fullText }) {
+  const key = streamKey(channel, threadTs, messageID, partID);
+  const state = streamBuffers.get(key);
+  const finalText = typeof fullText === "string" ? fullText : (state?.text || "");
+
+  if (state?.flushTimer) {
+    clearTimeout(state.flushTimer);
+    state.flushTimer = null;
+  }
+
+  if (!finalText.trim()) {
+    // Nothing to show — delete the placeholder if one exists.
+    if (state?.messageTs) {
+      try { await slack.chat.delete({ channel, ts: state.messageTs }); } catch {}
+    }
+    if (state) streamBuffers.delete(key);
+    return;
+  }
+
+  const rendered = markdownToSlackMrkdwn(finalText);
+  const hasLongCode = rendered.includes("```") && rendered.length > 2000;
+  const overflow = rendered.length > SLACK_MSG_LIMIT || hasLongCode;
+
+  if (overflow) {
+    // Replace the streaming placeholder with a brief note, then upload the
+    // full response as a file (matches the non-streaming long-response path).
+    if (state?.messageTs) {
+      try {
+        await slack.chat.update({
+          channel: state.channel,
+          ts: state.messageTs,
+          text: "_full response in file below_",
+          mrkdwn: true,
+        });
+      } catch {}
+    }
+    try {
+      await slack.filesUploadV2({
+        channel_id: channel,
+        thread_ts: threadTs,
+        content: finalText,
+        filename: "response.md",
+        title: "Response",
+      });
+    } catch (e) {
+      log(`stream finalize upload error: ${e?.message || e}`);
+      // Last-ditch fallback: chunked send.
+      await sendToSlack(channel, rendered, threadTs);
+    }
+  } else if (state?.messageTs) {
+    // Final clean render into the existing streaming message.
+    try {
+      await slack.chat.update({
+        channel: state.channel,
+        ts: state.messageTs,
+        text: rendered,
+        mrkdwn: true,
+      });
+    } catch (e) {
+      log(`stream finalize update error: ${e?.message || e}`);
+      await sendToSlack(channel, rendered, threadTs);
+    }
+  } else {
+    // No placeholder was ever posted (post failed or only fullText given).
+    await sendToSlack(channel, rendered, threadTs);
+  }
+
+  if (state) {
+    state.finalized = true;
+    streamBuffers.delete(key);
+  }
+}
+
+async function abortStream({ channel, threadTs, messageID, partID }) {
+  const key = streamKey(channel, threadTs, messageID, partID);
+  const state = streamBuffers.get(key);
+  if (!state) return;
+  if (state.flushTimer) {
+    clearTimeout(state.flushTimer);
+    state.flushTimer = null;
+  }
+  // Best-effort: finalize with whatever text we have, so partial output
+  // isn't lost on error. If empty, delete the placeholder.
+  if (state.text && state.text.trim()) {
+    await finalizeStream({ channel, threadTs, messageID, partID, fullText: state.text });
+  } else if (state.messageTs) {
+    try { await slack.chat.delete({ channel, ts: state.messageTs }); } catch {}
+    streamBuffers.delete(key);
+  } else {
+    streamBuffers.delete(key);
+  }
+}
+
 process.on("message", async (msg) => {
   if (msg?.type === "slack_send") {
     await sendToSlack(msg.channel, msg.text, msg.threadTs);
@@ -172,6 +399,14 @@ process.on("message", async (msg) => {
     try { await slack.reactions.remove({ channel: msg.channel, name: msg.name, timestamp: msg.timestamp }); } catch {}
   } else if (msg?.type === "slack_thinking_clear") {
     await stopThinking(msg.channel, msg.threadTs);
+  } else if (msg?.type === "slack_thinking_start") {
+    startThinking(msg.channel, msg.threadTs);
+  } else if (msg?.type === "slack_stream_delta") {
+    await handleStreamDelta(msg);
+  } else if (msg?.type === "slack_stream_finalize") {
+    await finalizeStream(msg);
+  } else if (msg?.type === "slack_stream_abort") {
+    await abortStream(msg);
   } else if (msg?.type === "slack_upload") {
     try {
       await slack.filesUploadV2({

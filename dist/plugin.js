@@ -12434,8 +12434,6 @@ import { fileURLToPath } from "url";
 import { homedir } from "os";
 var LOG_FILE = "/tmp/slack-agent-plugin.log";
 var SLACK_MSG_LIMIT = 3900;
-var RESPONSE_STALL_MS = 45e3;
-var RESPONSE_STALL_NOTIFY_INTERVAL_MS = 6e4;
 var DEFAULT_ATTACH_TIMEOUT_SEC = 600;
 var BG_OUTPUT_REQUEST_TIMEOUT_MS = 15e3;
 var BG_OUTPUT_CANDIDATE_PATHS = ["/background/output", "/background_output", "/api/background/output"];
@@ -12670,6 +12668,7 @@ async function handleMessage(channel, text, ts, messageTs, isAllowed = true) {
     sendIPC({ type: "slack_reaction_remove", channel, name: "eyes", timestamp: actualTs });
     return;
   }
+  const streamedTextParts = /* @__PURE__ */ new Set();
   try {
     const threadTs = ts;
     let sessionId = getSessionForThread(threadTs);
@@ -12734,7 +12733,6 @@ async function handleMessage(channel, text, ts, messageTs, isAllowed = true) {
     }
     let streamDone = false;
     let lastStreamActivityAt = Date.now();
-    let lastDelayNotifiedAt = 0;
     const timeout = setTimeout(() => {
       log("SSE timeout (6min)");
       streamDone = true;
@@ -12764,21 +12762,6 @@ async function handleMessage(channel, text, ts, messageTs, isAllowed = true) {
       } catch {
       }
     }, 2e3);
-    const delayCheck = setInterval(() => {
-      if (streamDone) {
-        clearInterval(delayCheck);
-        return;
-      }
-      const now = Date.now();
-      const stalledMs = now - lastStreamActivityAt;
-      const shouldNotify = stalledMs >= RESPONSE_STALL_MS && (lastDelayNotifiedAt === 0 || now - lastDelayNotifiedAt >= RESPONSE_STALL_NOTIFY_INTERVAL_MS);
-      if (shouldNotify) {
-        const stalledSec = Math.floor(stalledMs / 1e3);
-        slackSend(channel, `\u23F3 \uC751\uB2F5\uC774 \uC9C0\uC5F0\uB418\uACE0 \uC788\uC5B4\uC694 (${stalledSec}\uCD08 \uACBD\uACFC). \uACC4\uC18D \uCC98\uB9AC \uC911\uC785\uB2C8\uB2E4.`, threadTs);
-        lastDelayNotifiedAt = now;
-        log(`response stall detected: session=${sessionId} stalled=${stalledSec}s`);
-      }
-    }, 5e3);
     try {
       for await (const event of stream) {
         if (streamDone) break;
@@ -12847,6 +12830,30 @@ ${q.question}
             slackSend(channel, `\u{1F4AD} ${snippet}`, threadTs);
             log(`stream: \u{1F4AD}`);
           }
+          if (part.type === "text" && part.id && part.messageID) {
+            const streamId = `${part.messageID}:${part.id}`;
+            streamedTextParts.add(streamId);
+            const deltaText = evt.properties?.delta;
+            if (typeof deltaText === "string" && deltaText.length > 0) {
+              sendIPC({
+                type: "slack_stream_delta",
+                channel,
+                threadTs,
+                messageID: part.messageID,
+                partID: part.id,
+                delta: deltaText
+              });
+            } else if (typeof part.text === "string" && part.text.length > 0) {
+              sendIPC({
+                type: "slack_stream_delta",
+                channel,
+                threadTs,
+                messageID: part.messageID,
+                partID: part.id,
+                fullText: part.text
+              });
+            }
+          }
         }
         if (evt.type === "session.idle" && evt.properties?.sessionID === sessionId) {
           lastStreamActivityAt = Date.now();
@@ -12880,16 +12887,16 @@ ${q.question}
       streamDone = true;
       clearTimeout(timeout);
       clearInterval(idleCheck);
-      clearInterval(delayCheck);
     }
     try {
-      syncCursor = await syncAssistantMessagesSinceCursor(sessionId, channel, threadTs, syncCursor);
+      syncCursor = await syncAssistantMessagesSinceCursor(sessionId, channel, threadTs, syncCursor, streamedTextParts);
       if (syncCursor && sessions[threadTs]) {
         sessions[threadTs].lastSyncedMessageId = syncCursor;
         saveSessions();
       }
     } catch (fetchErr) {
       log(`final sync error: ${fetchErr.message}`);
+      abortOpenStreams(channel, threadTs, streamedTextParts);
     }
     if (backgroundTaskIDs.size > 0) {
       const autoTaskIds = [...backgroundTaskIDs].slice(0, AUTO_ATTACH_MAX_TASKS_PER_MESSAGE);
@@ -12927,6 +12934,7 @@ ${q.question}
     log(`session ${sessionId} completed`);
   } catch (e) {
     log(`error: ${e.message}`);
+    abortOpenStreams(channel, ts, streamedTextParts);
     sendIPC({ type: "slack_reaction_remove", channel, name: "eyes", timestamp: actualTs });
     clearProcessingIndicators(channel, ts);
     slackSend(channel, `\u274C \uC624\uB958: ${e.message}`, ts);
@@ -13193,12 +13201,15 @@ async function callBackgroundOutput(bgTaskID, requestTimeoutMs = BG_OUTPUT_REQUE
   }
   return { ok: false, statusCode: 500, error: "Unknown background output call failure." };
 }
-async function syncAssistantMessagesSinceCursor(sessionId, channel, threadTs, cursorId) {
+async function syncAssistantMessagesSinceCursor(sessionId, channel, threadTs, cursorId, streamedTextParts) {
   if (!pluginClient) return cursorId;
   const { data: messages } = await pluginClient.session.messages({
     path: { id: sessionId }
   });
-  if (!Array.isArray(messages) || messages.length === 0) return cursorId;
+  if (!Array.isArray(messages) || messages.length === 0) {
+    abortOpenStreams(channel, threadTs, streamedTextParts);
+    return cursorId;
+  }
   let startIndex = 0;
   if (cursorId) {
     const cursorIdx = messages.findIndex((m) => m.id === cursorId);
@@ -13210,11 +13221,39 @@ async function syncAssistantMessagesSinceCursor(sessionId, channel, threadTs, cu
       log(`skip assistant message with non-array parts: ${msg.id || "unknown"}`);
       continue;
     }
-    const textParts = msg.parts.filter((p) => p.type === "text" && p.text).map((p) => p.text).join("\n");
-    if (textParts) sendLongText(channel, textParts, threadTs);
+    let unstreamedText = "";
+    for (const part of msg.parts) {
+      if (part?.type !== "text" || !part.text) continue;
+      const streamId = `${msg.id}:${part.id}`;
+      if (streamedTextParts?.has(streamId)) {
+        sendIPC({
+          type: "slack_stream_finalize",
+          channel,
+          threadTs,
+          messageID: msg.id,
+          partID: part.id,
+          fullText: part.text
+        });
+        streamedTextParts.delete(streamId);
+      } else {
+        unstreamedText += (unstreamedText ? "\n" : "") + part.text;
+      }
+    }
+    if (unstreamedText) sendLongText(channel, unstreamedText, threadTs);
   }
+  abortOpenStreams(channel, threadTs, streamedTextParts);
   const lastMsg = messages[messages.length - 1];
   return lastMsg?.id || cursorId;
+}
+function abortOpenStreams(channel, threadTs, streamedTextParts) {
+  if (!streamedTextParts || streamedTextParts.size === 0) return;
+  for (const streamId of streamedTextParts) {
+    const sepIdx = streamId.indexOf(":");
+    const messageID = sepIdx >= 0 ? streamId.slice(0, sepIdx) : streamId;
+    const partID = sepIdx >= 0 ? streamId.slice(sepIdx + 1) : "";
+    sendIPC({ type: "slack_stream_abort", channel, threadTs, messageID, partID });
+  }
+  streamedTextParts.clear();
 }
 async function handleAttachBackgroundTask(channel, bgTaskID, ts, options = {}) {
   const announceStart = options.announceStart !== false;
