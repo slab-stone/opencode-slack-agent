@@ -1,11 +1,19 @@
 #!/usr/bin/env node
 import { SocketModeClient } from "@slack/socket-mode";
 import { WebClient } from "@slack/web-api";
-import { readFileSync, appendFileSync } from "fs";
+import { readFileSync, appendFileSync, mkdirSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
 import * as https from "https";
 
-const LOG_FILE = "/tmp/slack-agent-plugin.log";
-const log = (m) => { try { appendFileSync(LOG_FILE, `[${new Date().toISOString()}] worker: ${m}\n`); } catch {} };
+const LOG_DIR = join(homedir(), ".local/share/opencode/log");
+const LOG_FILE = join(LOG_DIR, "slack-agent-plugin.log");
+const log = (m) => {
+  try {
+    mkdirSync(LOG_DIR, { recursive: true });
+    appendFileSync(LOG_FILE, `[${new Date().toISOString()}] worker: ${m}\n`);
+  } catch {}
+};
 
 const SLACK_MSG_LIMIT = 3900;
 const botToken = process.env.SLACK_BOT_TOKEN;
@@ -13,20 +21,21 @@ const appToken = process.env.SLACK_APP_TOKEN;
 const caCerts = process.env.NODE_EXTRA_CA_CERTS;
 
 // Slack "thinking" indicator (assistant.threads.setStatus).
-// Auto-clears when the bot replies in the thread, but Slack also enforces a
-// 2-minute timeout — we refresh on a timer to keep it alive for long sessions.
-// Docs: https://docs.slack.dev/reference/methods/assistant.threads.setStatus
+// Auto-clears when chat.postMessage fires in the thread — we restore it after
+// each sendToSlack so it persists for the entire processing duration.
+//
+// IMPORTANT: always pass `loading_messages`. If omitted, Slack rotates its own
+// default AI phrases ("Analysing...", "Summarising findings…", etc.). We only
+// want the trailing-dots animation on a fixed "Thinking" label.
 const INSTANT_REACTION_NAME = "eyes";
-const THINKING_STATUS_REFRESH_MS = 90_000; // refresh before the 2-min Slack timeout
-const THINKING_STATUS_TEXT = "is thinking...";
-// Cycle only the trailing dots so the indicator pulses subtly instead of
-// rotating through different status phrases (which feels noisy).
+const THINKING_STATUS_REFRESH_MS = 90_000; // refresh before Slack's 2-min timeout
+const THINKING_STATUS_TEXT = "Thinking...";
 const THINKING_LOADING_MESSAGES = [
   "Thinking.",
   "Thinking..",
   "Thinking...",
 ];
-const activeThinking = new Map(); // key: `${channelId}:${threadTs}` -> NodeJS Timeout
+const activeThinking = new Map(); // key: `${channelId}:${threadTs}` -> interval
 
 if (!botToken || !appToken) {
   process.exit(1);
@@ -116,32 +125,32 @@ async function sendToSlack(channel, text, threadTs) {
   try {
     if (text.length <= SLACK_MSG_LIMIT) {
       await slack.chat.postMessage({ channel, text, thread_ts: threadTs, mrkdwn: true });
-      restoreThinkingIfActive(channel, threadTs);
-      return;
-    }
-    const chunks = [];
-    const lines = text.split("\n");
-    let current = "";
-    for (const line of lines) {
-      if (current.length + line.length + 1 > SLACK_MSG_LIMIT) {
-        chunks.push(current);
-        current = line;
-      } else {
-        current = current ? current + "\n" + line : line;
+    } else {
+      const chunks = [];
+      const lines = text.split("\n");
+      let current = "";
+      for (const line of lines) {
+        if (current.length + line.length + 1 > SLACK_MSG_LIMIT) {
+          chunks.push(current);
+          current = line;
+        } else {
+          current = current ? current + "\n" + line : line;
+        }
+      }
+      if (current) chunks.push(current);
+      for (let i = 0; i < chunks.length; i++) {
+        const prefix = chunks.length > 1 ? `_(${i + 1}/${chunks.length})_\n` : "";
+        await slack.chat.postMessage({
+          channel,
+          text: prefix + chunks[i],
+          thread_ts: threadTs || undefined,
+          mrkdwn: true,
+        });
       }
     }
-    if (current) chunks.push(current);
-    for (let i = 0; i < chunks.length; i++) {
-      const prefix = chunks.length > 1 ? `_(${i + 1}/${chunks.length})_\n` : "";
-      await slack.chat.postMessage({
-        channel,
-        text: prefix + chunks[i],
-        thread_ts: threadTs || undefined,
-        mrkdwn: true,
-      });
-    }
-    restoreThinkingIfActive(channel, threadTs);
   } catch {}
+  // chat.postMessage clears the indicator — re-assert if still processing.
+  restoreThinkingIfActive(channel, threadTs);
 }
 
 async function addReaction(channel, name, timestamp) {
@@ -170,26 +179,32 @@ async function setAssistantStatus(channelId, threadTs, status, loadingMessages) 
   }
 }
 
-// Show "is thinking..." + start a refresh interval. Idempotent per thread.
+function assertThinkingStatus(channelId, threadTs) {
+  // Always include loading_messages so Slack never falls back to its defaults.
+  setAssistantStatus(channelId, threadTs, THINKING_STATUS_TEXT, THINKING_LOADING_MESSAGES);
+}
+
+function restoreThinkingIfActive(channelId, threadTs) {
+  if (!threadTs) return;
+  if (!activeThinking.has(thinkingKey(channelId, threadTs))) return;
+  assertThinkingStatus(channelId, threadTs);
+}
+
 function startThinking(channelId, threadTs) {
   const key = thinkingKey(channelId, threadTs);
   if (activeThinking.has(key)) return;
-  setAssistantStatus(channelId, threadTs, THINKING_STATUS_TEXT, THINKING_LOADING_MESSAGES);
+  assertThinkingStatus(channelId, threadTs);
   const interval = setInterval(() => {
-    setAssistantStatus(channelId, threadTs, THINKING_STATUS_TEXT, THINKING_LOADING_MESSAGES);
+    assertThinkingStatus(channelId, threadTs);
   }, THINKING_STATUS_REFRESH_MS);
   activeThinking.set(key, interval);
 }
 
-// Stop the refresh interval and explicitly clear the indicator.
-// Always safe to call — no-op if nothing is active.
 async function stopThinking(channelId, threadTs) {
   const key = thinkingKey(channelId, threadTs);
   const interval = activeThinking.get(key);
-  if (interval) {
-    clearInterval(interval);
-    activeThinking.delete(key);
-  }
+  if (interval) clearInterval(interval);
+  activeThinking.delete(key);
   await setAssistantStatus(channelId, threadTs, "");
 }
 

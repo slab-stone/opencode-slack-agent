@@ -12428,11 +12428,12 @@ tool.schema = external_exports;
 
 // src/plugin.ts
 import { spawn } from "child_process";
-import { appendFileSync, readFileSync, writeFileSync, existsSync } from "fs";
+import { appendFileSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import { homedir } from "os";
-var LOG_FILE = "/tmp/slack-agent-plugin.log";
+var LOG_DIR = join(homedir(), ".local/share/opencode/log");
+var LOG_FILE = join(LOG_DIR, "slack-agent-plugin.log");
 var SLACK_MSG_LIMIT = 3900;
 var DEFAULT_ATTACH_TIMEOUT_SEC = 600;
 var BG_OUTPUT_REQUEST_TIMEOUT_MS = 15e3;
@@ -12463,10 +12464,32 @@ function expandTilde(p) {
 }
 function log(m) {
   try {
+    mkdirSync(LOG_DIR, { recursive: true });
     appendFileSync(LOG_FILE, `[${(/* @__PURE__ */ new Date()).toISOString()}] plugin: ${m}
 `);
   } catch {
   }
+}
+function resolveNodeBinary() {
+  const explicit = process.env.NODE_BINARY?.trim();
+  if (explicit && existsSync(explicit)) return explicit;
+  for (const dir of (process.env.PATH || "").split(":")) {
+    if (!dir) continue;
+    const candidate = join(dir, "node");
+    if (existsSync(candidate)) return candidate;
+  }
+  const fallbacks = [
+    join(homedir(), ".local/share/mise/installs/node/22/bin/node"),
+    join(homedir(), ".local/share/mise/shims/node"),
+    "/usr/local/bin/node",
+    "/usr/bin/node"
+  ];
+  for (const candidate of fallbacks) {
+    if (existsSync(candidate)) return candidate;
+  }
+  throw new Error(
+    `node binary not found (NODE_BINARY=${process.env.NODE_BINARY || ""} PATH=${process.env.PATH || ""})`
+  );
 }
 function loadSessions() {
   try {
@@ -13565,11 +13588,24 @@ var workerEnvCache = null;
 function startWorker(env, dyingWorker) {
   workerEnvCache = env;
   const workerPath = join(dirname(fileURLToPath(import.meta.url)), "socket-worker.js");
-  log(`starting worker: ${workerPath}`);
-  const newWorker = spawn("node", [workerPath], {
-    env: { ...process.env, ...env },
-    stdio: ["ignore", "ignore", "ignore", "ipc"],
+  let nodeBinary;
+  try {
+    nodeBinary = resolveNodeBinary();
+  } catch (err) {
+    log(`FATAL: ${err instanceof Error ? err.message : String(err)}`);
+    throw err;
+  }
+  log(`starting worker: node=${nodeBinary} worker=${workerPath}`);
+  const newWorker = spawn(nodeBinary, [workerPath], {
+    env: { ...process.env, ...env, NODE_BINARY: nodeBinary },
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
     detached: false
+  });
+  newWorker.stderr?.on("data", (chunk) => {
+    log(`worker stderr: ${String(chunk).trimEnd()}`);
+  });
+  newWorker.on("error", (err) => {
+    log(`worker spawn error: ${err.message} (node=${nodeBinary} path=${workerPath})`);
   });
   attachWorkerHandlers(newWorker);
   const oldWorker = dyingWorker ?? null;
