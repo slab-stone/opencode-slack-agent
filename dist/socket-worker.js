@@ -185,7 +185,7 @@ function assertThinkingStatus(channelId, threadTs) {
 }
 
 function restoreThinkingIfActive(channelId, threadTs) {
-  if (!threadTs) return;
+  if (!channelId || !threadTs) return;
   if (!activeThinking.has(thinkingKey(channelId, threadTs))) return;
   assertThinkingStatus(channelId, threadTs);
 }
@@ -206,17 +206,6 @@ async function stopThinking(channelId, threadTs) {
   if (interval) clearInterval(interval);
   activeThinking.delete(key);
   await setAssistantStatus(channelId, threadTs, "");
-}
-
-// Slack auto-clears the assistant.threads.setStatus indicator whenever the
-// bot posts a new message in the thread (chat.postMessage). For multi-step
-// turns (text -> tool -> more text) this makes the bot look dead between
-// steps. Re-assert the status after every postMessage if thinking is active.
-function restoreThinkingIfActive(channelId, threadTs) {
-  if (!channelId || !threadTs) return;
-  const key = thinkingKey(channelId, threadTs);
-  if (!activeThinking.has(key)) return;
-  setAssistantStatus(channelId, threadTs, THINKING_STATUS_TEXT, THINKING_LOADING_MESSAGES);
 }
 
 // --- Streaming response buffer ---
