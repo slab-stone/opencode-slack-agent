@@ -1428,11 +1428,15 @@ const pluginModule: PluginModule = {
     const botToken = (options?.SLACK_BOT_TOKEN as string) || process.env.SLACK_BOT_TOKEN || "";
     const appToken = (options?.SLACK_APP_TOKEN as string) || process.env.SLACK_APP_TOKEN || "";
 
+    // Default OFF so interactive `opencode` TUI sessions (which load the same
+    // global opencode.json) do not spawn a second Socket Mode worker and fight
+    // the daemon for the Slack connection. The systemd unit sets
+    // SLACK_AGENT_ENABLED=true explicitly.
     const enabled = process.env.SLACK_AGENT_ENABLED
       ?? (options?.SLACK_AGENT_ENABLED as string)
-      ?? "true";
+      ?? "false";
     if (enabled === "false" || enabled === "0") {
-      log("DISABLED — SLACK_AGENT_ENABLED=false");
+      log("DISABLED — SLACK_AGENT_ENABLED not set (set to true in the daemon unit)");
       initialized = true;
       return { tool: { slack_status: slackStatusTool } };
     }

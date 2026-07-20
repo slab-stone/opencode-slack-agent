@@ -13673,9 +13673,9 @@ var pluginModule = {
     if (initialized) return { tool: { slack_status: slackStatusTool } };
     const botToken = options?.SLACK_BOT_TOKEN || process.env.SLACK_BOT_TOKEN || "";
     const appToken = options?.SLACK_APP_TOKEN || process.env.SLACK_APP_TOKEN || "";
-    const enabled = process.env.SLACK_AGENT_ENABLED ?? options?.SLACK_AGENT_ENABLED ?? "true";
+    const enabled = process.env.SLACK_AGENT_ENABLED ?? options?.SLACK_AGENT_ENABLED ?? "false";
     if (enabled === "false" || enabled === "0") {
-      log("DISABLED \u2014 SLACK_AGENT_ENABLED=false");
+      log("DISABLED \u2014 SLACK_AGENT_ENABLED not set (set to true in the daemon unit)");
       initialized = true;
       return { tool: { slack_status: slackStatusTool } };
     }
