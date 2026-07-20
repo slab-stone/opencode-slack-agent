@@ -24,12 +24,12 @@ const caCerts = process.env.NODE_EXTRA_CA_CERTS;
 // Auto-clears when chat.postMessage fires in the thread — we restore it after
 // each sendToSlack so it persists for the entire processing duration.
 //
-// IMPORTANT: always pass `loading_messages`. If omitted, Slack rotates its own
-// default AI phrases ("Analysing...", "Summarising findings…", etc.). We only
-// want the trailing-dots animation on a fixed "Thinking" label.
+// Do NOT customize `status` — keep Slack's conventional "is thinking..."
+// (renders as "<Bot> is thinking..."). Only override `loading_messages`;
+// if omitted, Slack rotates its own AI phrases ("Analysing...", etc.).
 const INSTANT_REACTION_NAME = "eyes";
 const THINKING_STATUS_REFRESH_MS = 90_000; // refresh before Slack's 2-min timeout
-const THINKING_STATUS_TEXT = "Thinking...";
+const THINKING_STATUS_TEXT = "is thinking...";
 const THINKING_LOADING_MESSAGES = [
   "Thinking.",
   "Thinking..",
@@ -180,7 +180,7 @@ async function setAssistantStatus(channelId, threadTs, status, loadingMessages) 
 }
 
 function assertThinkingStatus(channelId, threadTs) {
-  // Always include loading_messages so Slack never falls back to its defaults.
+  // status stays at Slack's default wording; only loading_messages are customized.
   setAssistantStatus(channelId, threadTs, THINKING_STATUS_TEXT, THINKING_LOADING_MESSAGES);
 }
 
